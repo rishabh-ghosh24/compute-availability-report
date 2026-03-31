@@ -6,12 +6,12 @@ A single-file Python CLI tool that generates self-contained HTML availability re
 
 ## How it works
 
-The tool queries two OCI Monitoring metrics every hour for each instance:
+The tool queries two OCI Monitoring metrics for each instance across the reporting period:
 
-- **`CpuUtilization`** (namespace: `oci_computeagent`) — emitted by the in-guest monitoring agent. Presence of any data point proves the VM was running.
-- **`instance_status`** (namespace: `oci_compute_infrastructure_health`) — emitted by the hypervisor independently of any agent. Reports whether the underlying infrastructure is healthy (`1.0`) or unhealthy (`0.0`).
+- **`CpuUtilization`** (namespace: `oci_computeagent`) — emitted by the in-guest monitoring agent approximately every minute. Presence of any data point within an hour proves the VM was running.
+- **`instance_status`** (namespace: `oci_compute_infrastructure_health`) — emitted by the hypervisor independently of any agent, approximately every 5 minutes. Reports whether the underlying infrastructure is healthy (`1.0`) or unhealthy (`0.0`).
 
-The combination of these two signals determines each hour's classification:
+The raw data points are aggregated into **hourly buckets**. For each hour, the combination of these two signals determines the classification:
 
 | CpuUtilization | instance\_status | Classification | Rationale |
 |---|---|---|---|
