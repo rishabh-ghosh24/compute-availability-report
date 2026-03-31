@@ -11,9 +11,26 @@ The tool queries two OCI Monitoring metrics every hour for each instance:
 - **`CpuUtilization`** (namespace: `oci_computeagent`) — emitted by the in-guest monitoring agent. Presence of any data point proves the VM was running.
 - **`instance_status`** (namespace: `oci_compute_infrastructure_health`) — emitted by the hypervisor independently of any agent. Reports whether the underlying infrastructure is healthy (`1.0`) or unhealthy (`0.0`).
 
-Each hour is classified as **up** (CPU data present and infra healthy), **down** (infra unhealthy), **stopped** (no signals — instance was not running), or **nodata** (query failure). Stopped hours are excluded from the availability denominator. If any hour has `nodata`, the instance shows N/A rather than a potentially misleading percentage (fail-closed).
+The combination of these two signals determines each hour's classification:
 
-Results are aggregated per-instance, per-compartment, and fleet-wide, then rendered into a single offline-capable HTML report with interactive charts, heatmaps, and print styles.
+| CpuUtilization | instance\_status | Classification | Rationale |
+|---|---|---|---|
+| Has data | 0 (healthy) | **UP** | Running and healthy — best signal |
+| Has data | 1 (unhealthy) | **DOWN** | Running but infra degraded |
+| Has data | no data | **UP** | Agent running, status not reported (rare) |
+| No data | 0 (healthy) | **UP** | Infra healthy, agent disabled/issue |
+| No data | 1 (unhealthy) | **DOWN** | Infra issue confirmed |
+| No data | no data | **STOPPED** | Excluded from denominator |
+
+Stopped hours are excluded from the availability denominator. If any hour has `nodata` (metric query failure), the instance shows N/A rather than a potentially misleading percentage (fail-closed).
+
+**Availability formula:**
+
+```
+Availability % = (UP hours) / (UP hours + DOWN hours) × 100
+```
+
+Stopped hours do not count against availability. Results are aggregated per-instance, per-compartment, and fleet-wide, then rendered into a single offline-capable HTML report with interactive charts, heatmaps, and print styles.
 
 ## Prerequisites
 
