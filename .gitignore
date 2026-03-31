@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Generated reports (keep sample in examples/)
+availability_report_*.html
+
+# Exclusion lists (may contain customer-specific instance names)
+exclude.list
+*.exclude
