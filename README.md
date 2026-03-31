@@ -2,9 +2,18 @@
 
 A single-file Python CLI tool that generates self-contained HTML availability reports for OCI Compute VM instances. Built for MSP/partner operations teams who need to prove compute uptime for SLA-based contractual payments.
 
-The tool queries two OCI Monitoring metrics (CpuUtilization and instance_status), computes per-instance, per-compartment, and fleet-level availability percentages, and renders an offline-capable HTML report with interactive charts and heatmaps.
-
 ![Sample Report](examples/sample_report.png)
+
+## How it works
+
+The tool queries two OCI Monitoring metrics every hour for each instance:
+
+- **`CpuUtilization`** (namespace: `oci_computeagent`) — emitted by the in-guest monitoring agent. Presence of any data point proves the VM was running.
+- **`instance_status`** (namespace: `oci_compute_infrastructure_health`) — emitted by the hypervisor independently of any agent. Reports whether the underlying infrastructure is healthy (`1.0`) or unhealthy (`0.0`).
+
+Each hour is classified as **up** (CPU data present and infra healthy), **down** (infra unhealthy), **stopped** (no signals — instance was not running), or **nodata** (query failure). Stopped hours are excluded from the availability denominator. If any hour has `nodata`, the instance shows N/A rather than a potentially misleading percentage (fail-closed).
+
+Results are aggregated per-instance, per-compartment, and fleet-wide, then rendered into a single offline-capable HTML report with interactive charts, heatmaps, and print styles.
 
 ## Prerequisites
 
@@ -21,7 +30,7 @@ The fastest way to get started on a fresh OCI VM (OEL 9):
 
 ```bash
 # One-line setup: installs git, python3, oci SDK, clones repo, runs tests
-curl -sL https://raw.githubusercontent.com/rishabh-ghosh24/compute-availability-report/sla-report/scripts/setup_oel9.sh | bash
+curl -sL https://raw.githubusercontent.com/rishabh-ghosh24/compute-availability-report/main/scripts/setup_oel9.sh | bash
 ```
 
 Or step by step:
@@ -33,10 +42,9 @@ sudo dnf install -y git python3 python3-pip
 # 2. Install OCI Python SDK
 pip3 install --user oci
 
-# 3. Clone and checkout
+# 3. Clone
 git clone https://github.com/rishabh-ghosh24/compute-availability-report.git
 cd compute-availability-report
-git checkout sla-report
 
 # 4. Verify setup
 python3 -m pytest tests/ -v
@@ -216,7 +224,7 @@ The report uses a fail-closed approach to data completeness. If any metric query
 
 This design ensures that availability numbers are never overstated. An N/A result means "we cannot confirm the availability for this period" and should prompt investigation into why data was missing.
 
-## Current scope and limitations
+## Limitations
 
 1. **VM instances only** -- bare metal (BM) instances use a different metric (`health_status`) and are not supported in v1.
 2. **Current non-terminated instances only** -- the report discovers instances that currently exist in a non-TERMINATED state. Instances that were deleted during the reporting period are not included.
@@ -265,24 +273,12 @@ To generate reports on a schedule, set up a cron job on the monitoring VM:
 
 ## Authentication modes
 
-### Instance Principals (default)
+| Mode | When to use | Flag |
+|------|-------------|------|
+| **Instance Principals** (default) | Running on an OCI VM in a dynamic group with IAM policies. No config files needed. | _(none — default)_ |
+| **OCI config file** | Local development or environments without Instance Principals. Reads `~/.oci/config`. | `--auth config --profile DEFAULT` |
 
-Used when running on an OCI VM that belongs to a dynamic group with the required IAM policies. No configuration files needed.
-
-```bash
-python3 compute_availability_report.py \
-  --compartment-id ocid1.compartment.oc1..aaaa...
-```
-
-### OCI config file
-
-Used for local development or environments without Instance Principals. Reads credentials from `~/.oci/config`.
-
-```bash
-python3 compute_availability_report.py \
-  --auth config --profile DEFAULT \
-  --compartment-id ocid1.compartment.oc1..aaaa...
-```
+See the [Quick start](#quick-start--generating-reports) for example commands using each mode.
 
 ## IAM setup
 

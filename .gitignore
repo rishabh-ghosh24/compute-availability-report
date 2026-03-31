@@ -6,9 +6,30 @@ __pycache__/
 dist/
 build/
 
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
 # Generated reports (keep sample in examples/)
 availability_report_*.html
 
 # Exclusion lists (may contain customer-specific instance names)
 exclude.list
 *.exclude
+
+# Terraform state (iam/)
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl

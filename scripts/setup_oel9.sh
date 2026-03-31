@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/rishabh-ghosh24/compute-availability-report.git"
-BRANCH="sla-report"
+BRANCH="main"
 INSTALL_DIR="$HOME/compute-availability-report"
 
 echo "════════════════════════════════════════════════════"
@@ -72,7 +72,7 @@ else
     echo "  If using Instance Principals (default), ensure:"
     echo "    1. VM is in a dynamic group"
     echo "    2. IAM policies grant read access to instances, metrics, compartments"
-    echo "    See: sla-report/iam/ for Terraform examples"
+    echo "    See: iam/ for Terraform examples"
 fi
 
 # ── 5. Verify chart.min.js is present ─────────────────────────

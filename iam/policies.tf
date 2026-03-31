@@ -1,7 +1,3 @@
-variable "tenancy_ocid" {}
-variable "compartment_name" {}
-variable "bucket_name" { default = "availability-reports" }
-
 resource "oci_identity_policy" "availability_reporter_policy" {
   name           = "availability-reporter-policy"
   description    = "Allow availability report generation"
