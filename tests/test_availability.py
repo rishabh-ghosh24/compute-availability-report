@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 from compute_availability_report import (
     classify_hour, calculate_batch_groups, build_hourly_buckets,
-    collect_metrics, collect_all_metrics, DATAPOINT_LIMIT,
+    collect_metrics, collect_all_metrics, DATAPOINT_LIMIT, STATUS_CALL_THROTTLE_SECS,
 )
 
 
@@ -821,6 +821,12 @@ class TestCollectMetrics:
 class TestCollectAllMetrics:
     """Integration-level tests for the tenancy/compartment routing logic."""
 
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self):
+        """Suppress real sleeping in all tests — prevents 200-instance tests from taking 10s."""
+        with patch("time.sleep"):
+            yield
+
     def _times(self, days=30):
         end = datetime(2026, 3, 31, 0, 0, 0, tzinfo=timezone.utc)
         return end - timedelta(days=days), end
@@ -1422,6 +1428,28 @@ class TestCollectAllMetrics:
         unknown_instance_id = instances[1]["id"]
         assert unknown_instance_id not in failed_ids, (
             "Instance in unknown compartment must not appear in failed_ids"
+        )
+
+    def test_status_calls_are_throttled(self):
+        """A sleep of STATUS_CALL_THROTTLE_SECS must be issued before each instance_status call."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        instances = self._make_instances(3, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        start, end = self._times(30)
+
+        with patch("time.sleep") as mock_sleep:
+            collect_all_metrics(self._ok_client(), comp_id, comp_map, instances, start, end)
+
+        throttle_calls = [c for c in mock_sleep.call_args_list
+                          if c == call(STATUS_CALL_THROTTLE_SECS)]
+        assert len(throttle_calls) == 3, (
+            f"Expected 3 throttle sleeps (one per status call), "
+            f"got {len(throttle_calls)}: {mock_sleep.call_args_list}"
         )
 
 

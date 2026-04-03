@@ -544,6 +544,10 @@ DATAPOINT_LIMIT = 80_000  # safety margin below 100K API limit
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # seconds; doubles each attempt (2s, 4s, 8s)
 
+# Minimum pause between consecutive instance_status calls to avoid sustained 429s.
+# At 1100 instances: 1100 × 0.05 s = 55 s added, but retry storms (2–8 s each) eliminated.
+STATUS_CALL_THROTTLE_SECS = 0.05
+
 
 def build_hourly_buckets(start_time, end_time):
     """Build list of hourly bucket keys (ISO format, UTC) for the reporting period."""
@@ -683,6 +687,7 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
         - status_metrics: {instance_ocid: {hour_key: value}}
         - failed_instance_ids: set of instance OCIDs where metric queries failed
     """
+    import time as _time
     hours = int((end_time - start_time).total_seconds() / 3600)
     cpu_metrics = {}
     status_metrics = {}
@@ -739,6 +744,7 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
         # OCI Monitoring rejects multi-resourceId || filters for instance_status at
         # ALL scopes (tenancy and compartment). Query one instance at a time.
         for inst_id in scope_instance_ids:
+            _time.sleep(STATUS_CALL_THROTTLE_SECS)  # throttle to avoid sustained 429s
             log.info(f"Querying instance_status for {inst_id[:30]}...")
             batch_status, status_failed = collect_metrics(
                 monitoring_client, comp_id,
