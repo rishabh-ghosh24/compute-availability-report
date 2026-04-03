@@ -1061,7 +1061,7 @@ class TestCollectAllMetrics:
     # ── Failure isolation ─────────────────────────────────────────────────
 
     def test_failed_batch_marks_only_that_batch(self):
-        """A 400 on one batch must only mark those instances as failed."""
+        """A 400 on the first CPU batch must mark exactly those instances as failed."""
         try:
             import oci
             err = oci.exceptions.ServiceError(400, "InvalidParameter", {}, "bad")
@@ -1072,13 +1072,18 @@ class TestCollectAllMetrics:
         instances = self._make_instances(200, compartment_id=comp_id)
         comp_map = self._compartment_map(comp_id)
 
-        call_count = [0]
+        # 30 days = 720 hours; first CPU batch contains exactly max_per_batch instances
+        hours = 720
+        max_per_batch = DATAPOINT_LIMIT // hours  # 111
+        first_batch_ids = {inst["id"] for inst in instances[:max_per_batch]}
+
         response = MagicMock()
         response.data = []
+        call_count = [0]
 
         def side_effect(*args, **kwargs):
             call_count[0] += 1
-            # Fail the first call, succeed all others
+            # Fail only the first call (first CPU batch); all subsequent calls succeed
             if call_count[0] == 1:
                 raise err
             return response
@@ -1089,9 +1094,11 @@ class TestCollectAllMetrics:
 
         _, _, failed_ids = collect_all_metrics(client, comp_id, comp_map, instances, start, end)
 
-        # Some instances failed, but not all 200
-        assert len(failed_ids) > 0
-        assert len(failed_ids) < 200
+        # Exactly the first CPU batch must be marked failed — no more, no less
+        assert failed_ids == first_batch_ids, (
+            f"Expected exactly the first batch ({len(first_batch_ids)} instances) to be "
+            f"marked failed, got {len(failed_ids)} instances"
+        )
 
     def test_no_instances_in_compartment_skipped(self):
         """Compartments with no discovered instances must generate zero API calls."""
