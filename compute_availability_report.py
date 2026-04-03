@@ -539,6 +539,11 @@ def group_instances_by_compartment(instances):
 
 DATAPOINT_LIMIT = 80_000  # safety margin below 100K API limit
 
+# Retry configuration for transient API errors (429 TooManyRequests, 5xx).
+# 400 errors are not retried — they indicate a query bug, not a transient fault.
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2  # seconds; doubles each attempt (2s, 4s, 8s)
+
 
 def build_hourly_buckets(start_time, end_time):
     """Build list of hourly bucket keys (ISO format, UTC) for the reporting period."""
@@ -602,22 +607,45 @@ def collect_metrics(monitoring_client, compartment_id, namespace, metric_name,
     else:
         query = f"{metric_name}[1h].max()"
 
-    try:
-        result = monitoring_client.summarize_metrics_data(
-            compartment_id,
-            oci.monitoring.models.SummarizeMetricsDataDetails(
-                namespace=namespace,
-                query=query,
-                start_time=start_time.isoformat(),
-                end_time=end_time.isoformat(),
-                resolution="1h",
-            ),
-            compartment_id_in_subtree=use_subtree,
-        ).data
-    except Exception as e:
-        log.warning(f"Metric query failed for {namespace}/{metric_name} "
-                    f"in {compartment_id}: {e}")
-        return {}, True  # Return failure flag
+    import time as _time
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            result = monitoring_client.summarize_metrics_data(
+                compartment_id,
+                oci.monitoring.models.SummarizeMetricsDataDetails(
+                    namespace=namespace,
+                    query=query,
+                    start_time=start_time.isoformat(),
+                    end_time=end_time.isoformat(),
+                    resolution="1h",
+                ),
+                compartment_id_in_subtree=use_subtree,
+            ).data
+            last_exc = None
+            break  # success — exit retry loop
+        except oci.exceptions.ServiceError as e:
+            last_exc = e
+            if e.status == 400:
+                # Query error (bad filter, unsupported pattern) — retrying won't help
+                log.warning(f"Metric query failed (400, not retrying) for "
+                            f"{namespace}/{metric_name} in {compartment_id[:30]}...: {e.message}")
+                return {}, True
+            wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+            log.warning(f"Metric query attempt {attempt}/{MAX_RETRIES} failed ({e.status}) "
+                        f"for {namespace}/{metric_name} — retrying in {wait}s")
+            _time.sleep(wait)
+        except Exception as e:
+            last_exc = e
+            wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+            log.warning(f"Metric query attempt {attempt}/{MAX_RETRIES} failed "
+                        f"for {namespace}/{metric_name}: {e} — retrying in {wait}s")
+            _time.sleep(wait)
+
+    if last_exc is not None:
+        log.warning(f"Metric query failed after {MAX_RETRIES} attempts for "
+                    f"{namespace}/{metric_name} in {compartment_id}: {last_exc}")
+        return {}, True
 
     # Parse results: group data points by resourceId
     metrics_by_instance = {}
@@ -641,8 +669,13 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
     """Collect CpuUtilization and instance_status for all instances.
 
     Query strategy:
-    - If root_compartment_id is tenancy OCID: single query with subtree=True
-    - Otherwise: per-compartment queries with subtree=False
+    - CpuUtilization: batched with || filter at compartment scope; unfiltered when
+      the whole fleet fits in a single datapoint batch at tenancy scope.
+    - instance_status: one API call per instance at all scopes (|| filter rejected
+      by OCI Monitoring regardless of scope).
+    - Tenancy OCID + fits in one CPU batch: single unfiltered subtree=True CPU query;
+      one-per-instance subtree=True status queries.
+    - Otherwise: per-compartment queries (subtree=False) for both metrics.
 
     Returns:
         (cpu_metrics, status_metrics, failed_instance_ids) where:
@@ -658,14 +691,23 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
     use_subtree = is_tenancy_ocid(root_compartment_id)
 
     if use_subtree:
-        # Tenancy-wide: single query with subtree
+        all_ids = [inst["id"] for inst in instances]
+        if len(calculate_batch_groups(all_ids, hours)) > 1:
+            # OCI Monitoring rejects multi-resourceId || filters when
+            # compartment_id_in_subtree=True, and batching requires those filters.
+            # Fall back to per-compartment queries.
+            log.info("Instance count requires batching; switching to per-compartment metric queries.")
+            use_subtree = False
+
+    if use_subtree:
+        # Tenancy-wide: single query with subtree (fits in one batch, no resourceId filter needed)
         scopes = [(root_compartment_id, True)]
     else:
-        # Non-root: per-compartment queries
+        # Per-compartment queries
         scopes = [(comp_id, False) for comp_id in compartment_map.keys()]
 
     for comp_id, subtree in scopes:
-        # Determine instances in this scope for batching
+        # Determine instances in this scope
         if subtree:
             scope_instance_ids = [inst["id"] for inst in instances]
         else:
@@ -674,36 +716,41 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
         if not scope_instance_ids:
             continue
 
-        batches = calculate_batch_groups(scope_instance_ids, hours)
-
-        for batch in batches:
-            log.info(f"Querying metrics for batch of {len(batch)} instances "
+        # ── CpuUtilization: batch by datapoint limit (unchanged behaviour) ──────────
+        # || filter works at compartment scope; unfiltered call used when fleet fits
+        # in a single batch at tenancy scope.
+        cpu_batches = calculate_batch_groups(scope_instance_ids, hours)
+        for batch in cpu_batches:
+            log.info(f"Querying CpuUtilization for batch of {len(batch)} instance(s) "
                      f"in {comp_id[:30]}...")
-
-            # CpuUtilization
             batch_cpu, cpu_failed = collect_metrics(
                 monitoring_client, comp_id,
                 "oci_computeagent", "CpuUtilization",
                 start_time, end_time,
                 use_subtree=subtree,
-                instance_ids=batch if len(batches) > 1 else None,
+                instance_ids=batch if len(cpu_batches) > 1 else None,
             )
             cpu_metrics.update(batch_cpu)
+            if cpu_failed:
+                # Mark all instances in this CPU batch as failed
+                failed_instance_ids.update(batch)
 
-            # instance_status
+        # ── instance_status: one call per instance ───────────────────────────────────
+        # OCI Monitoring rejects multi-resourceId || filters for instance_status at
+        # ALL scopes (tenancy and compartment). Query one instance at a time.
+        for inst_id in scope_instance_ids:
+            log.info(f"Querying instance_status for {inst_id[:30]}...")
             batch_status, status_failed = collect_metrics(
                 monitoring_client, comp_id,
                 "oci_compute_infrastructure_health", "instance_status",
                 start_time, end_time,
                 use_subtree=subtree,
-                instance_ids=batch if len(batches) > 1 else None,
+                instance_ids=[inst_id],
             )
             status_metrics.update(batch_status)
-
-            if cpu_failed or status_failed:
-                # Mark specific instances in this batch as failed,
-                # not the whole compartment -- preserves successful batches
-                failed_instance_ids.update(batch)
+            if status_failed:
+                # Only this instance failed; others in the scope are unaffected
+                failed_instance_ids.add(inst_id)
 
     return cpu_metrics, status_metrics, failed_instance_ids
 

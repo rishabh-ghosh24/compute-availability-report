@@ -1,9 +1,12 @@
 import pytest
 import sys
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock, call
 from datetime import datetime, timezone, timedelta
 
-from compute_availability_report import classify_hour, calculate_batch_groups, build_hourly_buckets
+from compute_availability_report import (
+    classify_hour, calculate_batch_groups, build_hourly_buckets,
+    collect_metrics, collect_all_metrics, DATAPOINT_LIMIT,
+)
 
 
 # Tests for parse_args function
@@ -459,6 +462,967 @@ class TestBuildAvailabilityMatrix:
         # inst2 succeeded -> normal classification
         assert matrix["inst2"]["h0"] == "up"
         assert matrix["inst2"]["h1"] == "up"
+
+
+class TestBatching_Boundary:
+    """Edge cases around the batch size boundary (80K datapoint limit)."""
+
+    def test_exactly_at_limit_is_one_batch(self):
+        # 111 instances × 720 hours = 79,920 ≤ 80,000 → 1 batch
+        hours = 720  # 30 days
+        max_per_batch = DATAPOINT_LIMIT // hours  # 111
+        ids = [f"ocid{i}" for i in range(max_per_batch)]
+        batches = calculate_batch_groups(ids, hours)
+        assert len(batches) == 1
+
+    def test_one_over_limit_is_two_batches(self):
+        hours = 720
+        max_per_batch = DATAPOINT_LIMIT // hours  # 111
+        ids = [f"ocid{i}" for i in range(max_per_batch + 1)]
+        batches = calculate_batch_groups(ids, hours)
+        assert len(batches) == 2
+        # All instance IDs are covered exactly once
+        flat = [iid for batch in batches for iid in batch]
+        assert flat == ids
+
+    def test_single_instance_always_one_batch(self):
+        for hours in [168, 720, 1440, 2160]:  # 7, 30, 60, 90 days
+            batches = calculate_batch_groups(["ocid1"], hours)
+            assert len(batches) == 1
+            assert batches[0] == ["ocid1"]
+
+    def test_empty_list_returns_empty(self):
+        assert calculate_batch_groups([], hours=720) == []
+
+    def test_90_day_window_tighter_batches(self):
+        # 90 days = 2160 hours → 80000/2160 = 37 per batch
+        hours = 2160
+        ids = [f"ocid{i}" for i in range(100)]
+        batches = calculate_batch_groups(ids, hours)
+        assert all(len(b) <= DATAPOINT_LIMIT // hours for b in batches)
+        flat = [iid for batch in batches for iid in batch]
+        assert flat == ids  # no duplicates, no gaps
+
+    def test_hours_larger_than_datapoint_limit_batch_size_is_one(self):
+        # hours > DATAPOINT_LIMIT → floor division = 0 → max(1, 0) = 1 → each instance its own batch
+        ids = [f"ocid{i}" for i in range(5)]
+        batches = calculate_batch_groups(ids, hours=DATAPOINT_LIMIT + 1)
+        assert len(batches) == len(ids), "Each instance must be its own batch"
+        assert all(len(b) == 1 for b in batches)
+        flat = [iid for batch in batches for iid in batch]
+        assert flat == ids
+
+    def test_single_hour_window_large_fleet_one_batch(self):
+        # hours=1 → batch_size = 80,000 → all instances comfortably fit in one batch
+        ids = [f"ocid{i}" for i in range(500)]
+        batches = calculate_batch_groups(ids, hours=1)
+        assert len(batches) == 1
+        assert len(batches[0]) == 500
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared across metric tests
+# ---------------------------------------------------------------------------
+
+def _make_monitoring_client(return_data=None):
+    """Return a mock OCI MonitoringClient with summarize_metrics_data stubbed."""
+    client = MagicMock()
+    response = MagicMock()
+    response.data = return_data or []
+    client.summarize_metrics_data.return_value = response
+    return client
+
+
+def _make_service_error(status, message="error"):
+    """Return a mock oci.exceptions.ServiceError."""
+    try:
+        import oci
+        err = MagicMock(spec=oci.exceptions.ServiceError)
+    except Exception:
+        err = MagicMock()
+    err.status = status
+    err.message = message
+    return err
+
+
+class TestCollectMetrics:
+    """Unit tests for collect_metrics query building and error handling."""
+
+    def _start_end(self):
+        end = datetime(2026, 3, 31, 0, 0, 0, tzinfo=timezone.utc)
+        start = end - timedelta(days=7)
+        return start, end
+
+    def test_no_instance_ids_produces_unfiltered_query(self):
+        client = _make_monitoring_client()
+        start, end = self._start_end()
+        collect_metrics(client, "comp1", "oci_computeagent", "CpuUtilization",
+                        start, end, use_subtree=False, instance_ids=None)
+        call_args = client.summarize_metrics_data.call_args
+        details = call_args[0][1]
+        assert details.query == "CpuUtilization[1h].max()"
+
+    def test_single_instance_id_uses_equality_predicate(self):
+        client = _make_monitoring_client()
+        start, end = self._start_end()
+        collect_metrics(client, "comp1", "oci_computeagent", "CpuUtilization",
+                        start, end, use_subtree=False, instance_ids=["ocid1.instance.aaa"])
+        details = client.summarize_metrics_data.call_args[0][1]
+        # Single id: no || separator
+        assert 'resourceId = "ocid1.instance.aaa"' in details.query
+        assert " || " not in details.query
+
+    def test_multiple_instance_ids_uses_or_predicate(self):
+        client = _make_monitoring_client()
+        start, end = self._start_end()
+        collect_metrics(client, "comp1", "oci_computeagent", "CpuUtilization",
+                        start, end, use_subtree=False,
+                        instance_ids=["ocid1.instance.aaa", "ocid1.instance.bbb"])
+        details = client.summarize_metrics_data.call_args[0][1]
+        assert " || " in details.query
+        assert 'resourceId = "ocid1.instance.aaa"' in details.query
+        assert 'resourceId = "ocid1.instance.bbb"' in details.query
+
+    def test_use_subtree_passed_through(self):
+        client = _make_monitoring_client()
+        start, end = self._start_end()
+        collect_metrics(client, "ocid1.tenancy.aaa", "oci_computeagent", "CpuUtilization",
+                        start, end, use_subtree=True, instance_ids=None)
+        call_args = client.summarize_metrics_data.call_args
+        assert call_args[1]["compartment_id_in_subtree"] is True
+
+    def test_success_returns_parsed_metrics(self):
+        dp = MagicMock()
+        dp.timestamp = datetime(2026, 3, 24, 5, 0, 0, tzinfo=timezone.utc)
+        dp.value = 42.5
+        metric_data = MagicMock()
+        metric_data.dimensions = {"resourceId": "ocid1.instance.aaa"}
+        metric_data.aggregated_datapoints = [dp]
+        client = _make_monitoring_client(return_data=[metric_data])
+        start, end = self._start_end()
+        result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                          "CpuUtilization", start, end)
+        assert not failed
+        assert "ocid1.instance.aaa" in result
+        assert result["ocid1.instance.aaa"]["2026-03-24T05:00:00Z"] == 42.5
+
+    def test_400_returns_failed_immediately_no_retry(self):
+        """400 errors must not be retried — they indicate a bad query."""
+        try:
+            import oci
+            err = oci.exceptions.ServiceError(400, "InvalidParameter", {}, "Not Supported yet")
+        except Exception:
+            pytest.skip("oci package not available")
+
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = err
+        start, end = self._start_end()
+        result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                          "CpuUtilization", start, end)
+        assert failed is True
+        assert result == {}
+        assert client.summarize_metrics_data.call_count == 1  # no retry
+
+    def test_429_is_retried(self):
+        """429 TooManyRequests must be retried up to MAX_RETRIES times."""
+        try:
+            import oci
+            err = oci.exceptions.ServiceError(429, "TooManyRequests", {}, "rate limited")
+        except Exception:
+            pytest.skip("oci package not available")
+
+        # Fail twice then succeed
+        response = MagicMock()
+        response.data = []
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, err, response]
+        start, end = self._start_end()
+        with patch("time.sleep"):  # avoid actual sleep in tests
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                              "CpuUtilization", start, end)
+        assert not failed
+        assert client.summarize_metrics_data.call_count == 3
+
+    def test_exhausted_retries_returns_failed(self):
+        """After MAX_RETRIES 5xx failures the call must return failed=True."""
+        try:
+            import oci
+            err = oci.exceptions.ServiceError(503, "ServiceUnavailable", {}, "down")
+        except Exception:
+            pytest.skip("oci package not available")
+
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = err
+        start, end = self._start_end()
+        from compute_availability_report import MAX_RETRIES
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                              "CpuUtilization", start, end)
+        assert failed is True
+        assert client.summarize_metrics_data.call_count == MAX_RETRIES
+
+    def test_empty_instance_ids_list_acts_as_no_filter(self):
+        """instance_ids=[] is falsy — must produce an unfiltered query, not crash."""
+        client = _make_monitoring_client()
+        start, end = self._start_end()
+        collect_metrics(client, "comp1", "oci_computeagent", "CpuUtilization",
+                        start, end, use_subtree=False, instance_ids=[])
+        details = client.summarize_metrics_data.call_args[0][1]
+        assert "resourceId" not in details.query
+        assert details.query == "CpuUtilization[1h].max()"
+
+    def test_dimensions_none_skips_entry_without_crash(self):
+        """metric_data.dimensions=None must be handled gracefully (skipped, no exception)."""
+        metric_data = MagicMock()
+        metric_data.dimensions = None
+        metric_data.aggregated_datapoints = []
+        client = _make_monitoring_client(return_data=[metric_data])
+        start, end = self._start_end()
+        result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                          "CpuUtilization", start, end)
+        assert not failed
+        assert result == {}
+
+    def test_dimensions_missing_resource_id_skips_entry(self):
+        """dimensions dict without 'resourceId' key must be skipped silently."""
+        metric_data = MagicMock()
+        metric_data.dimensions = {"other_key": "some_value"}
+        metric_data.aggregated_datapoints = []
+        client = _make_monitoring_client(return_data=[metric_data])
+        start, end = self._start_end()
+        result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                          "CpuUtilization", start, end)
+        assert not failed
+        assert result == {}
+
+    def test_resource_id_with_no_datapoints_returns_empty_hours(self):
+        """Valid resourceId with empty aggregated_datapoints → key present with {} hours dict."""
+        metric_data = MagicMock()
+        metric_data.dimensions = {"resourceId": "ocid1.instance.aaa"}
+        metric_data.aggregated_datapoints = []
+        client = _make_monitoring_client(return_data=[metric_data])
+        start, end = self._start_end()
+        result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                          "CpuUtilization", start, end)
+        assert not failed
+        assert "ocid1.instance.aaa" in result
+        assert result["ocid1.instance.aaa"] == {}
+
+    def test_multiple_entries_same_resource_id_hours_merged(self):
+        """Two metric_data entries for the same resourceId must merge into one dict."""
+        dp1 = MagicMock()
+        dp1.timestamp = datetime(2026, 3, 24, 0, 0, 0, tzinfo=timezone.utc)
+        dp1.value = 10.0
+        dp2 = MagicMock()
+        dp2.timestamp = datetime(2026, 3, 24, 1, 0, 0, tzinfo=timezone.utc)
+        dp2.value = 20.0
+        m1 = MagicMock()
+        m1.dimensions = {"resourceId": "ocid1.instance.aaa"}
+        m1.aggregated_datapoints = [dp1]
+        m2 = MagicMock()
+        m2.dimensions = {"resourceId": "ocid1.instance.aaa"}
+        m2.aggregated_datapoints = [dp2]
+        client = _make_monitoring_client(return_data=[m1, m2])
+        start, end = self._start_end()
+        result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                          "CpuUtilization", start, end)
+        assert not failed
+        hours = result["ocid1.instance.aaa"]
+        assert hours["2026-03-24T00:00:00Z"] == 10.0
+        assert hours["2026-03-24T01:00:00Z"] == 20.0
+
+    def test_non_service_error_exception_retried_then_fails(self):
+        """A generic exception (e.g. ConnectionError) must be retried, then return failed=True."""
+        from compute_availability_report import MAX_RETRIES
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = ConnectionError("network failure")
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                              "CpuUtilization", start, end)
+        assert failed is True
+        assert result == {}
+        assert client.summarize_metrics_data.call_count == MAX_RETRIES
+
+    def test_retry_backoff_sleep_values(self):
+        """Two 429 failures must sleep for 2s then 4s (exponential backoff).
+
+        Patches time.sleep (stdlib) directly — not compute_availability_report._time.sleep —
+        because the module imports time inside the function body, making the module-level
+        alias unreachable via monkeypatching.
+        """
+        try:
+            import oci
+            err = oci.exceptions.ServiceError(429, "TooManyRequests", {}, "rate limited")
+        except Exception:
+            pytest.skip("oci package not available")
+
+        response = MagicMock()
+        response.data = []
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, err, response]
+        start, end = self._start_end()
+        with patch("time.sleep") as mock_sleep:
+            collect_metrics(client, "comp1", "oci_computeagent", "CpuUtilization", start, end)
+        sleep_calls = mock_sleep.call_args_list
+        assert len(sleep_calls) == 2
+        assert sleep_calls[0] == call(2)   # RETRY_BACKOFF * 2^0
+        assert sleep_calls[1] == call(4)   # RETRY_BACKOFF * 2^1
+
+    def test_success_on_second_attempt_returns_data(self):
+        """One 429 failure followed by success must return the data with failed=False."""
+        try:
+            import oci
+            err = oci.exceptions.ServiceError(429, "TooManyRequests", {}, "rate limited")
+        except Exception:
+            pytest.skip("oci package not available")
+
+        dp = MagicMock()
+        dp.timestamp = datetime(2026, 3, 24, 5, 0, 0, tzinfo=timezone.utc)
+        dp.value = 99.0
+        metric_data = MagicMock()
+        metric_data.dimensions = {"resourceId": "ocid1.instance.aaa"}
+        metric_data.aggregated_datapoints = [dp]
+        success_response = MagicMock()
+        success_response.data = [metric_data]
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, success_response]
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                              "CpuUtilization", start, end)
+        assert not failed
+        assert "ocid1.instance.aaa" in result
+        assert result["ocid1.instance.aaa"]["2026-03-24T05:00:00Z"] == 99.0
+        assert client.summarize_metrics_data.call_count == 2
+
+    def test_5xx_status_codes_are_retried(self):
+        """HTTP 500 and 503 must be retried (not treated like 400 bail-out)."""
+        try:
+            import oci
+        except Exception:
+            pytest.skip("oci package not available")
+
+        from compute_availability_report import MAX_RETRIES
+        for status_code in [500, 503]:
+            err = oci.exceptions.ServiceError(status_code, "ServerError", {}, "server error")
+            client = MagicMock()
+            client.summarize_metrics_data.side_effect = err
+            start, end = self._start_end()
+            with patch("time.sleep"):
+                result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                                  "CpuUtilization", start, end)
+            assert failed is True
+            assert client.summarize_metrics_data.call_count == MAX_RETRIES, (
+                f"Status {status_code} should be retried {MAX_RETRIES} times"
+            )
+
+
+class TestCollectAllMetrics:
+    """Integration-level tests for the tenancy/compartment routing logic."""
+
+    def _times(self, days=30):
+        end = datetime(2026, 3, 31, 0, 0, 0, tzinfo=timezone.utc)
+        return end - timedelta(days=days), end
+
+    def _make_instances(self, n, compartment_id="ocid1.compartment.oc1..aaa"):
+        return [{"id": f"ocid1.instance.oc1..{i:04d}", "compartment_id": compartment_id}
+                for i in range(n)]
+
+    def _compartment_map(self, comp_id="ocid1.compartment.oc1..aaa"):
+        return {comp_id: {"name": "prod", "parent_id": None, "label": "prod"}}
+
+    def _ok_client(self):
+        """Monitoring client that always returns empty metric data (success)."""
+        client = MagicMock()
+        response = MagicMock()
+        response.data = []
+        client.summarize_metrics_data.return_value = response
+        return client
+
+    # ── Tenancy scope: small fleet stays subtree=True ──────────────────────
+
+    def test_small_tenancy_uses_subtree_true(self):
+        """Fleet that fits in one batch must keep compartment_id_in_subtree=True."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        tenancy_id = "ocid1.tenancy.oc1..aaa"
+        # 30 days = 720 hours; 80000/720=111 per batch — 50 instances < 111 → 1 batch
+        instances = self._make_instances(50, compartment_id="ocid1.compartment.oc1..child")
+        comp_map = {
+            tenancy_id: {"name": "tenancy", "parent_id": None, "label": "tenancy"},
+            "ocid1.compartment.oc1..child": {"name": "prod", "parent_id": tenancy_id, "label": "prod"},
+        }
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, tenancy_id, comp_map, instances, start, end)
+
+        calls = client.summarize_metrics_data.call_args_list
+        subtree_values = [c[1]["compartment_id_in_subtree"] for c in calls]
+        assert all(v is True for v in subtree_values), (
+            "Small fleet at tenancy scope must use compartment_id_in_subtree=True"
+        )
+
+    def test_small_tenancy_unfiltered_query(self):
+        """Small-fleet tenancy: CpuUtilization uses one unfiltered call; instance_status
+        uses one call per instance (each filtered by a single resourceId predicate).
+        5 instances → 1 CPU call + 5 status calls = 6 total.
+        """
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        tenancy_id = "ocid1.tenancy.oc1..aaa"
+        instances = self._make_instances(5, compartment_id="ocid1.compartment.oc1..child")
+        comp_map = {tenancy_id: {"name": "tenancy", "parent_id": None, "label": "tenancy"}}
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, tenancy_id, comp_map, instances, start, end)
+
+        # Total: 1 unfiltered CPU call + 5 per-instance status calls
+        assert client.summarize_metrics_data.call_count == 6, (
+            f"Expected 6 calls (1 CPU + 5 status), got {client.summarize_metrics_data.call_count}"
+        )
+        for c in client.summarize_metrics_data.call_args_list:
+            query = c[0][1].query
+            ns = c[0][1].namespace
+            if ns == "oci_computeagent":
+                # CpuUtilization must remain unfiltered for a single-batch tenancy fleet
+                assert "resourceId" not in query, (
+                    f"Small-fleet CpuUtilization must use unfiltered query, got: {query}"
+                )
+            elif ns == "oci_compute_infrastructure_health":
+                # Each status call must use a single-resourceId filter (no ||)
+                assert 'resourceId = "' in query, (
+                    f"Status call at tenancy scope must include a single resourceId predicate, got: {query}"
+                )
+                assert " || " not in query, (
+                    f"Status call at tenancy scope must not use || filter, got: {query}"
+                )
+
+    # ── Tenancy scope: large fleet falls back to per-compartment ───────────
+
+    def test_large_tenancy_falls_back_to_per_compartment(self):
+        """Fleet requiring batching must switch to per-compartment (subtree=False)."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        tenancy_id = "ocid1.tenancy.oc1..aaa"
+        comp_id = "ocid1.compartment.oc1..child"
+        # 30 days = 720 hours; 80000/720=111 per batch — 200 instances → 2 batches
+        instances = self._make_instances(200, compartment_id=comp_id)
+        comp_map = {
+            tenancy_id: {"name": "tenancy", "parent_id": None, "label": "tenancy"},
+            comp_id: {"name": "prod", "parent_id": tenancy_id, "label": "prod"},
+        }
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, tenancy_id, comp_map, instances, start, end)
+
+        calls = client.summarize_metrics_data.call_args_list
+        subtree_values = [c[1]["compartment_id_in_subtree"] for c in calls]
+        assert all(v is False for v in subtree_values), (
+            "Large fleet at tenancy scope must fall back to per-compartment (subtree=False)"
+        )
+
+    def test_large_tenancy_fallback_uses_or_filter(self):
+        """Per-compartment batches must include resourceId || filter."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        tenancy_id = "ocid1.tenancy.oc1..aaa"
+        comp_id = "ocid1.compartment.oc1..child"
+        instances = self._make_instances(200, compartment_id=comp_id)
+        comp_map = {
+            tenancy_id: {"name": "tenancy", "parent_id": None, "label": "tenancy"},
+            comp_id: {"name": "prod", "parent_id": tenancy_id, "label": "prod"},
+        }
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, tenancy_id, comp_map, instances, start, end)
+
+        calls = client.summarize_metrics_data.call_args_list
+        # At least some calls must have resourceId filters (batched)
+        filtered_calls = [c for c in calls if "resourceId" in c[0][1].query]
+        assert len(filtered_calls) > 0
+
+    def test_boundary_exactly_at_batch_limit_stays_subtree(self):
+        """Fleet of exactly max_per_batch instances must NOT trigger fallback."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        tenancy_id = "ocid1.tenancy.oc1..aaa"
+        hours = 720  # 30 days
+        max_per_batch = DATAPOINT_LIMIT // hours  # 111
+        instances = self._make_instances(max_per_batch,
+                                          compartment_id="ocid1.compartment.oc1..child")
+        comp_map = {
+            tenancy_id: {"name": "tenancy", "parent_id": None, "label": "tenancy"},
+            "ocid1.compartment.oc1..child": {"name": "prod", "parent_id": tenancy_id, "label": "prod"},
+        }
+        client = self._ok_client()
+        end = datetime(2026, 3, 31, 0, 0, 0, tzinfo=timezone.utc)
+        start = end - timedelta(days=30)
+
+        collect_all_metrics(client, tenancy_id, comp_map, instances, start, end)
+
+        calls = client.summarize_metrics_data.call_args_list
+        subtree_values = [c[1]["compartment_id_in_subtree"] for c in calls]
+        assert all(v is True for v in subtree_values)
+
+    def test_boundary_one_over_limit_falls_back(self):
+        """Fleet of max_per_batch+1 instances must trigger per-compartment fallback."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        tenancy_id = "ocid1.tenancy.oc1..aaa"
+        comp_id = "ocid1.compartment.oc1..child"
+        hours = 720
+        max_per_batch = DATAPOINT_LIMIT // hours  # 111
+        instances = self._make_instances(max_per_batch + 1, compartment_id=comp_id)
+        comp_map = {
+            tenancy_id: {"name": "tenancy", "parent_id": None, "label": "tenancy"},
+            comp_id: {"name": "prod", "parent_id": tenancy_id, "label": "prod"},
+        }
+        client = self._ok_client()
+        end = datetime(2026, 3, 31, 0, 0, 0, tzinfo=timezone.utc)
+        start = end - timedelta(days=30)
+
+        collect_all_metrics(client, tenancy_id, comp_map, instances, start, end)
+
+        calls = client.summarize_metrics_data.call_args_list
+        subtree_values = [c[1]["compartment_id_in_subtree"] for c in calls]
+        assert all(v is False for v in subtree_values)
+
+    # ── Non-tenancy compartment ────────────────────────────────────────────
+
+    def test_compartment_scope_never_uses_subtree(self):
+        """Non-tenancy root must always use subtree=False."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"  # NOT a tenancy OCID
+        instances = self._make_instances(5, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        calls = client.summarize_metrics_data.call_args_list
+        for c in calls:
+            assert c[1]["compartment_id_in_subtree"] is False
+
+    def test_compartment_scope_large_fleet_batches_with_or(self):
+        """Large single-compartment fleet must batch with || filter (subtree=False)."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        instances = self._make_instances(200, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        calls = client.summarize_metrics_data.call_args_list
+        subtree_values = [c[1]["compartment_id_in_subtree"] for c in calls]
+        assert all(v is False for v in subtree_values)
+        filtered = [c for c in calls if "resourceId" in c[0][1].query]
+        assert len(filtered) > 0
+
+    # ── Failure isolation ─────────────────────────────────────────────────
+
+    def test_failed_batch_marks_only_that_batch(self):
+        """A 400 on one batch must only mark those instances as failed."""
+        try:
+            import oci
+            err = oci.exceptions.ServiceError(400, "InvalidParameter", {}, "bad")
+        except Exception:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        instances = self._make_instances(200, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+
+        call_count = [0]
+        response = MagicMock()
+        response.data = []
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            # Fail the first call, succeed all others
+            if call_count[0] == 1:
+                raise err
+            return response
+
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = side_effect
+        start, end = self._times(30)
+
+        _, _, failed_ids = collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        # Some instances failed, but not all 200
+        assert len(failed_ids) > 0
+        assert len(failed_ids) < 200
+
+    def test_no_instances_in_compartment_skipped(self):
+        """Compartments with no discovered instances must generate zero API calls."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        empty_comp = "ocid1.compartment.oc1..empty"
+        instances = self._make_instances(2, compartment_id=comp_id)
+        comp_map = {
+            comp_id: {"name": "prod", "parent_id": None, "label": "prod"},
+            empty_comp: {"name": "empty", "parent_id": None, "label": "empty"},
+        }
+        client = self._ok_client()
+        start, end = self._times(7)
+
+        collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        # All calls must be to comp_id, never to empty_comp
+        for c in client.summarize_metrics_data.call_args_list:
+            assert c[0][0] == comp_id
+
+    # ── P1+P2 regression tests ────────────────────────────────────────────
+
+    def test_instance_status_never_uses_or_filter(self):
+        """No instance_status query may contain || at any scope or fleet size.
+
+        This is the core P1 regression test. The original bug allowed || filters
+        in instance_status queries at compartment scope, causing 400 failures for
+        large compartments (≥112 instances at 30 days).
+        """
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        # 200 instances → 2 CPU batches at 30 days, so status was previously also batched
+        instances = self._make_instances(200, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        status_calls = [
+            c for c in client.summarize_metrics_data.call_args_list
+            if c[0][1].namespace == "oci_compute_infrastructure_health"
+        ]
+        assert len(status_calls) > 0, "Expected at least one instance_status call"
+        for c in status_calls:
+            query = c[0][1].query
+            assert " || " not in query, (
+                f"instance_status must never use || filter, got: {query}"
+            )
+
+    def test_instance_status_always_uses_single_resourceid(self):
+        """Every instance_status call must contain exactly one resourceId predicate.
+
+        Both assertions are explicit: query contains resourceId = "..." AND does not
+        contain ||, so the intent is unambiguous even if query formatting changes.
+        """
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        # 5 instances comfortably under the batch threshold (111 at 30 days)
+        instances = self._make_instances(5, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        status_calls = [
+            c for c in client.summarize_metrics_data.call_args_list
+            if c[0][1].namespace == "oci_compute_infrastructure_health"
+        ]
+        assert len(status_calls) == 5, (
+            f"Expected 5 status calls (one per instance), got {len(status_calls)}"
+        )
+        for c in status_calls:
+            query = c[0][1].query
+            assert 'resourceId = "' in query, (
+                f"Each status call must include a single resourceId predicate, got: {query}"
+            )
+            assert " || " not in query, (
+                f"Status call must not use || multi-instance filter, got: {query}"
+            )
+
+    def test_cpu_batches_with_or_at_compartment_scope(self):
+        """CpuUtilization at compartment scope must still batch with || (efficiency preserved).
+
+        This confirms the fix did NOT remove CPU batching as a side effect.
+        """
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        # 200 instances → 2 CPU batches at 30 days (threshold = 111)
+        instances = self._make_instances(200, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        cpu_calls = [
+            c for c in client.summarize_metrics_data.call_args_list
+            if c[0][1].namespace == "oci_computeagent"
+        ]
+        assert len(cpu_calls) >= 2, f"Expected ≥2 CPU batches for 200 instances, got {len(cpu_calls)}"
+        for c in cpu_calls:
+            assert " || " in c[0][1].query, (
+                f"CPU batch at compartment scope must use || filter, got: {c[0][1].query}"
+            )
+
+    def test_empty_instances_list_makes_no_api_calls(self):
+        """instances=[] → all scopes empty → zero API calls, empty results."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        comp_map = self._compartment_map(comp_id)
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        cpu, status, failed = collect_all_metrics(client, comp_id, comp_map, [], start, end)
+
+        assert client.summarize_metrics_data.call_count == 0
+        assert cpu == {}
+        assert status == {}
+        assert failed == set()
+
+    def test_only_cpu_fails_marks_that_batch_failed(self):
+        """A 400 on the CPU batch must mark all instances in that batch as failed."""
+        try:
+            import oci
+            err = oci.exceptions.ServiceError(400, "InvalidParameter", {}, "bad")
+        except Exception:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        # 5 instances — 1 CPU batch (comfortably under 111 threshold at 30 days)
+        instances = self._make_instances(5, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+
+        response = MagicMock()
+        response.data = []
+
+        def side_effect(*args, **kwargs):
+            details = args[1]
+            if details.namespace == "oci_computeagent":
+                raise err
+            return response
+
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = side_effect
+        start, end = self._times(30)
+
+        _, _, failed_ids = collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        expected_ids = {inst["id"] for inst in instances}
+        assert failed_ids == expected_ids, (
+            f"All instances in the failed CPU batch must be marked failed. "
+            f"Expected {expected_ids}, got {failed_ids}"
+        )
+
+    def test_only_status_fails_marks_only_that_instance(self):
+        """A status failure for one instance must not affect other instances.
+
+        The mock is keyed on the specific failing instance ID (not call order),
+        proving per-instance granularity rather than positional behaviour.
+        """
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        instances = self._make_instances(3, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        failing_id = instances[1]["id"]
+        start, end = self._times(30)
+
+        def mock_collect(client, comp_id, namespace, metric, start, end,
+                         use_subtree=False, instance_ids=None):
+            if (namespace == "oci_compute_infrastructure_health"
+                    and instance_ids == [failing_id]):
+                return {}, True
+            return {}, False
+
+        with patch("compute_availability_report.collect_metrics", side_effect=mock_collect):
+            _, _, failed_ids = collect_all_metrics(
+                self._ok_client(), comp_id, comp_map, instances, start, end
+            )
+
+        assert failed_ids == {failing_id}, (
+            f"Only the failing instance should be in failed_ids. "
+            f"Expected {{{failing_id}}}, got {failed_ids}"
+        )
+
+    def test_all_queries_fail_all_instances_marked_failed(self):
+        """When every API call returns 400, all instances must be in failed_instance_ids."""
+        try:
+            import oci
+            err = oci.exceptions.ServiceError(400, "InvalidParameter", {}, "bad")
+        except Exception:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        instances = self._make_instances(3, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = err
+        start, end = self._times(30)
+
+        _, _, failed_ids = collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        expected_ids = {inst["id"] for inst in instances}
+        assert failed_ids == expected_ids
+
+    def test_multiple_compartments_all_queried_in_fallback(self):
+        """When root is non-tenancy, all compartments with instances must be queried."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        root = "ocid1.compartment.oc1..root"   # non-tenancy → always per-compartment
+        comp1 = "ocid1.compartment.oc1..comp1"
+        comp2 = "ocid1.compartment.oc1..comp2"
+        comp3 = "ocid1.compartment.oc1..comp3"
+
+        # 2 instances per compartment, comfortably under batch threshold
+        instances = (
+            self._make_instances(2, compartment_id=comp1) +
+            self._make_instances(2, compartment_id=comp2) +
+            self._make_instances(2, compartment_id=comp3)
+        )
+        comp_map = {
+            root:  {"name": "root",  "parent_id": None,  "label": "root"},
+            comp1: {"name": "comp1", "parent_id": root,  "label": "comp1"},
+            comp2: {"name": "comp2", "parent_id": root,  "label": "comp2"},
+            comp3: {"name": "comp3", "parent_id": root,  "label": "comp3"},
+        }
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        collect_all_metrics(client, root, comp_map, instances, start, end)
+
+        called_comp_ids = {c[0][0] for c in client.summarize_metrics_data.call_args_list}
+        assert comp1 in called_comp_ids, "comp1 must be queried"
+        assert comp2 in called_comp_ids, "comp2 must be queried"
+        assert comp3 in called_comp_ids, "comp3 must be queried"
+
+    def test_cpu_metrics_from_multiple_batches_accumulated(self):
+        """Data from all CPU batches must be merged; no instances dropped."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        import re as _re
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        # 200 instances → 2 CPU batches at 30 days (threshold = 111)
+        instances = self._make_instances(200, compartment_id=comp_id)
+        comp_map = self._compartment_map(comp_id)
+        start, end = self._times(30)
+
+        def side_effect(*args, **kwargs):
+            details = args[1]
+            response = MagicMock()
+            if details.namespace == "oci_computeagent":
+                ids_in_query = _re.findall(r'resourceId = "([^"]+)"', details.query)
+                items = []
+                for rid in ids_in_query:
+                    dp = MagicMock()
+                    dp.timestamp = datetime(2026, 3, 24, 0, 0, 0, tzinfo=timezone.utc)
+                    dp.value = 50.0
+                    m = MagicMock()
+                    m.dimensions = {"resourceId": rid}
+                    m.aggregated_datapoints = [dp]
+                    items.append(m)
+                response.data = items
+            else:
+                response.data = []
+            return response
+
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = side_effect
+
+        cpu_metrics, _, _ = collect_all_metrics(client, comp_id, comp_map, instances, start, end)
+
+        assert len(cpu_metrics) == 200, (
+            f"All 200 instances must appear in cpu_metrics, got {len(cpu_metrics)}"
+        )
+        for inst in instances:
+            assert inst["id"] in cpu_metrics
+
+    def test_instance_with_unknown_compartment_silently_skipped(self):
+        """An instance whose compartment_id is not in compartment_map must be silently ignored."""
+        try:
+            import oci  # noqa: F401
+        except ImportError:
+            pytest.skip("oci package not available")
+
+        comp_id = "ocid1.compartment.oc1..aaa"
+        unknown_comp = "ocid1.compartment.oc1..unknown"
+
+        instances = (
+            self._make_instances(1, compartment_id=comp_id) +
+            self._make_instances(1, compartment_id=unknown_comp)
+        )
+        # comp_map does NOT contain unknown_comp
+        comp_map = self._compartment_map(comp_id)
+        client = self._ok_client()
+        start, end = self._times(30)
+
+        # Must not raise
+        cpu, status, failed_ids = collect_all_metrics(
+            client, comp_id, comp_map, instances, start, end
+        )
+
+        unknown_instance_id = instances[1]["id"]
+        assert unknown_instance_id not in failed_ids, (
+            "Instance in unknown compartment must not appear in failed_ids"
+        )
 
 
 class TestDiscoveryWarningFormat:
