@@ -1,6 +1,7 @@
+import logging
 import pytest
 import re
-from compute_availability_report import generate_html_report
+from compute_availability_report import generate_html_report, embed_logo
 
 
 @pytest.fixture
@@ -95,6 +96,12 @@ class TestHTMLReport:
         logo_data = "data:image/png;base64,iVBORw0KGgo="
         html = generate_html_report(**sample_report_data, logo_data=logo_data)
         assert logo_data in html
+
+    def test_embed_logo_warns_when_file_missing(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = embed_logo("/nonexistent/logo.png")
+        assert result is None
+        assert "/nonexistent/logo.png" in caplog.text
 
     def test_footer_version(self, sample_report_data):
         html = generate_html_report(**sample_report_data)
