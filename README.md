@@ -113,7 +113,7 @@ compute_availability_report.py [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--days {7,14,30,60,90}` | `7` | Reporting period in days. Maximum 90 days (OCI hourly retention limit). |
+| `--days INT` | `7` | Reporting period in days (1-90). Maximum 90 days (OCI hourly retention limit). |
 | `--sla-target FLOAT` | `99.95` | SLA target percentage for compliance comparison. |
 | `--running-only` | off | Only include currently RUNNING instances. By default, all non-TERMINATED instances are included. |
 | `--region REGION` | from auth | OCI region override. |

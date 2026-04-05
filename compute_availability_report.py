@@ -40,8 +40,8 @@ def parse_args(argv=None):
     parser.add_argument("--profile", default="DEFAULT", help="OCI config profile (default: DEFAULT)")
 
     # Reporting
-    parser.add_argument("--days", type=int, choices=[7, 14, 30, 60, 90],
-                        default=7, help="Reporting period in days (default: 7)")
+    parser.add_argument("--days", type=int, default=7,
+                        help="Reporting period in days, 1-90 (default: 7)")
     parser.add_argument("--sla-target", type=float, default=99.95,
                         help="SLA target %% (default: 99.95)")
     parser.add_argument("--running-only", action="store_true",
@@ -66,7 +66,14 @@ def parse_args(argv=None):
     parser.add_argument("--par-expiry-days", type=int, default=30,
                         help="PAR link expiry in days (default: 30)")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.days < 1 or args.days > 90:
+        parser.error(
+            "--days must be between 1 and 90. "
+            "OCI Monitoring retains metric data for a maximum of 90 days "
+            "(at hourly resolution)."
+        )
+    return args
 
 
 def setup_auth(args):
@@ -539,6 +546,15 @@ def group_instances_by_compartment(instances):
 
 DATAPOINT_LIMIT = 80_000  # safety margin below 100K API limit
 
+# Retry configuration for transient API errors (429 TooManyRequests, 5xx).
+# 400 errors are not retried — they indicate a query bug, not a transient fault.
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2  # seconds; doubles each attempt (2s, 4s, 8s)
+
+# Minimum pause between consecutive instance_status calls to avoid sustained 429s.
+# At 1100 instances: 1100 × 0.05 s = 55 s added, but retry storms (2–8 s each) eliminated.
+STATUS_CALL_THROTTLE_SECS = 0.05
+
 
 def build_hourly_buckets(start_time, end_time):
     """Build list of hourly bucket keys (ISO format, UTC) for the reporting period."""
@@ -602,22 +618,45 @@ def collect_metrics(monitoring_client, compartment_id, namespace, metric_name,
     else:
         query = f"{metric_name}[1h].max()"
 
-    try:
-        result = monitoring_client.summarize_metrics_data(
-            compartment_id,
-            oci.monitoring.models.SummarizeMetricsDataDetails(
-                namespace=namespace,
-                query=query,
-                start_time=start_time.isoformat(),
-                end_time=end_time.isoformat(),
-                resolution="1h",
-            ),
-            compartment_id_in_subtree=use_subtree,
-        ).data
-    except Exception as e:
-        log.warning(f"Metric query failed for {namespace}/{metric_name} "
-                    f"in {compartment_id}: {e}")
-        return {}, True  # Return failure flag
+    import time as _time
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            result = monitoring_client.summarize_metrics_data(
+                compartment_id,
+                oci.monitoring.models.SummarizeMetricsDataDetails(
+                    namespace=namespace,
+                    query=query,
+                    start_time=start_time.isoformat(),
+                    end_time=end_time.isoformat(),
+                    resolution="1h",
+                ),
+                compartment_id_in_subtree=use_subtree,
+            ).data
+            last_exc = None
+            break  # success — exit retry loop
+        except oci.exceptions.ServiceError as e:
+            last_exc = e
+            if e.status == 400:
+                # Query error (bad filter, unsupported pattern) — retrying won't help
+                log.warning(f"Metric query failed (400, not retrying) for "
+                            f"{namespace}/{metric_name} in {compartment_id[:30]}...: {e.message}")
+                return {}, True
+            wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+            log.warning(f"Metric query attempt {attempt}/{MAX_RETRIES} failed ({e.status}) "
+                        f"for {namespace}/{metric_name} — retrying in {wait}s")
+            _time.sleep(wait)
+        except Exception as e:
+            last_exc = e
+            wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+            log.warning(f"Metric query attempt {attempt}/{MAX_RETRIES} failed "
+                        f"for {namespace}/{metric_name}: {e} — retrying in {wait}s")
+            _time.sleep(wait)
+
+    if last_exc is not None:
+        log.warning(f"Metric query failed after {MAX_RETRIES} attempts for "
+                    f"{namespace}/{metric_name} in {compartment_id}: {last_exc}")
+        return {}, True
 
     # Parse results: group data points by resourceId
     metrics_by_instance = {}
@@ -641,8 +680,13 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
     """Collect CpuUtilization and instance_status for all instances.
 
     Query strategy:
-    - If root_compartment_id is tenancy OCID: single query with subtree=True
-    - Otherwise: per-compartment queries with subtree=False
+    - CpuUtilization: batched with || filter at compartment scope; unfiltered when
+      the whole fleet fits in a single datapoint batch at tenancy scope.
+    - instance_status: one API call per instance at all scopes (|| filter rejected
+      by OCI Monitoring regardless of scope).
+    - Tenancy OCID + fits in one CPU batch: single unfiltered subtree=True CPU query;
+      one-per-instance subtree=True status queries.
+    - Otherwise: per-compartment queries (subtree=False) for both metrics.
 
     Returns:
         (cpu_metrics, status_metrics, failed_instance_ids) where:
@@ -650,6 +694,7 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
         - status_metrics: {instance_ocid: {hour_key: value}}
         - failed_instance_ids: set of instance OCIDs where metric queries failed
     """
+    import time as _time
     hours = int((end_time - start_time).total_seconds() / 3600)
     cpu_metrics = {}
     status_metrics = {}
@@ -658,14 +703,23 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
     use_subtree = is_tenancy_ocid(root_compartment_id)
 
     if use_subtree:
-        # Tenancy-wide: single query with subtree
+        all_ids = [inst["id"] for inst in instances]
+        if len(calculate_batch_groups(all_ids, hours)) > 1:
+            # OCI Monitoring rejects multi-resourceId || filters when
+            # compartment_id_in_subtree=True, and batching requires those filters.
+            # Fall back to per-compartment queries.
+            log.info("Instance count requires batching; switching to per-compartment metric queries.")
+            use_subtree = False
+
+    if use_subtree:
+        # Tenancy-wide: single query with subtree (fits in one batch, no resourceId filter needed)
         scopes = [(root_compartment_id, True)]
     else:
-        # Non-root: per-compartment queries
+        # Per-compartment queries
         scopes = [(comp_id, False) for comp_id in compartment_map.keys()]
 
     for comp_id, subtree in scopes:
-        # Determine instances in this scope for batching
+        # Determine instances in this scope
         if subtree:
             scope_instance_ids = [inst["id"] for inst in instances]
         else:
@@ -674,36 +728,42 @@ def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
         if not scope_instance_ids:
             continue
 
-        batches = calculate_batch_groups(scope_instance_ids, hours)
-
-        for batch in batches:
-            log.info(f"Querying metrics for batch of {len(batch)} instances "
+        # ── CpuUtilization: batch by datapoint limit (unchanged behaviour) ──────────
+        # || filter works at compartment scope; unfiltered call used when fleet fits
+        # in a single batch at tenancy scope.
+        cpu_batches = calculate_batch_groups(scope_instance_ids, hours)
+        for batch in cpu_batches:
+            log.info(f"Querying CpuUtilization for batch of {len(batch)} instance(s) "
                      f"in {comp_id[:30]}...")
-
-            # CpuUtilization
             batch_cpu, cpu_failed = collect_metrics(
                 monitoring_client, comp_id,
                 "oci_computeagent", "CpuUtilization",
                 start_time, end_time,
                 use_subtree=subtree,
-                instance_ids=batch if len(batches) > 1 else None,
+                instance_ids=batch if len(cpu_batches) > 1 else None,
             )
             cpu_metrics.update(batch_cpu)
+            if cpu_failed:
+                # Mark all instances in this CPU batch as failed
+                failed_instance_ids.update(batch)
 
-            # instance_status
+        # ── instance_status: one call per instance ───────────────────────────────────
+        # OCI Monitoring rejects multi-resourceId || filters for instance_status at
+        # ALL scopes (tenancy and compartment). Query one instance at a time.
+        for inst_id in scope_instance_ids:
+            _time.sleep(STATUS_CALL_THROTTLE_SECS)  # throttle to avoid sustained 429s
+            log.info(f"Querying instance_status for {inst_id[:30]}...")
             batch_status, status_failed = collect_metrics(
                 monitoring_client, comp_id,
                 "oci_compute_infrastructure_health", "instance_status",
                 start_time, end_time,
                 use_subtree=subtree,
-                instance_ids=batch if len(batches) > 1 else None,
+                instance_ids=[inst_id],
             )
             status_metrics.update(batch_status)
-
-            if cpu_failed or status_failed:
-                # Mark specific instances in this batch as failed,
-                # not the whole compartment -- preserves successful batches
-                failed_instance_ids.update(batch)
+            if status_failed:
+                # Only this instance failed; others in the scope are unaffected
+                failed_instance_ids.add(inst_id)
 
     return cpu_metrics, status_metrics, failed_instance_ids
 
@@ -865,7 +925,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
 details:not([open]) > .comp-header::before {{ transform: rotate(-90deg); }}
 .comp-header .comp-count {{ color: #888780; font-weight: 400; }}
 .comp-header .comp-pct {{ color: #0f6e56; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }}
 th {{ text-align: left; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #888780; padding: 10px 16px; background: #faf9f6; border-bottom: 1px solid #e8e6df; }}
 th.center {{ text-align: center; }}
 td {{ padding: 12px 16px; border-bottom: 1px solid #f0efe9; }}
@@ -993,9 +1053,7 @@ td.center {{ text-align: center; }}
 <div class="tbl-wrap">
 """)
 
-    # Table header row (only first compartment gets the header)
-    first_comp = True
-    for comp_id, group in grouped.items():
+    for comp_idx, (comp_id, group) in enumerate(grouped.items()):
         comp_name = group["name"]
         comp_instances = group["instances"]
 
@@ -1006,21 +1064,26 @@ td.center {{ text-align: center; }}
         comp_pct_color = "#0f6e56" if comp_pct is not None and comp_pct >= sla_target else "#a32d2d"
 
         # Compartment header — collapsible via <details>/<summary>
-        border_style = ' style="border-top:2px solid #e8e6df;"' if not first_comp else ''
+        border_style = ' style="border-top:2px solid #e8e6df;"' if comp_idx > 0 else ''
         parts.append(f'<details class="comp-section" open{border_style}>')
         parts.append(f'<summary class="comp-header">{html.escape(comp_name)} <span class="comp-count">({len(comp_instances)} instances)</span> &mdash; <span class="comp-pct" style="color:{comp_pct_color};">{comp_pct_str}</span></summary>')
 
         # Table
-        parts.append('<table>')
-        if first_comp:
-            parts.append("""<thead><tr>
-<th style="width:28%;">Instance</th>
-<th class="center" style="width:14%;">Status</th>
-<th style="width:14%;">Availability</th>
-<th class="center" style="width:30%;">Uptime</th>
-<th style="width:14%;">Downtime</th>
+        parts.append("""<table>
+<colgroup>
+<col style="width:28%;">
+<col style="width:14%;">
+<col style="width:14%;">
+<col style="width:30%;">
+<col style="width:14%;">
+</colgroup>""")
+        parts.append("""<thead><tr>
+<th>Instance</th>
+<th class="center">Status</th>
+<th>Availability</th>
+<th class="center">Uptime</th>
+<th>Downtime</th>
 </tr></thead>""")
-            first_comp = False
 
         parts.append('<tbody>')
         for inst in comp_instances:
