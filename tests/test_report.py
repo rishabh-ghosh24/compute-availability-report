@@ -133,6 +133,37 @@ class TestHTMLReport:
         assert instances_card, "Instances monitored card not found"
         assert "partial scope" in instances_card.group(1).lower()
 
+    def test_all_tables_have_consistent_column_widths(self, sample_report_data):
+        """Every compartment table must have a <colgroup> with correct column widths."""
+        instances = list(sample_report_data["instances"])
+        instances.append({
+            "id": "ocid1.instance.oc1.bbb1", "name": "db-server-1", "state": "RUNNING",
+            "shape": "VM.Standard.E4.Flex", "compartment_name": "staging",
+            "compartment_id": "ocid1.comp.staging", "compartment_label": "staging",
+            "availability_pct": 99.80, "up_hours": 167, "down_hours": 1,
+            "stopped_hours": 0, "nodata_hours": 0, "monitored_hours": 168,
+            "downtime_minutes": 60, "data_complete": True,
+        })
+        data = {**sample_report_data, "instances": instances}
+        data["heatmap_data"] = {
+            **sample_report_data["heatmap_data"],
+            "ocid1.instance.oc1.bbb1": ["up"] * 168,
+        }
+        html = generate_html_report(**data)
+        table_count = html.count('<table>')
+        colgroup_count = html.count('<colgroup>')
+        assert table_count >= 2, f"Expected at least 2 tables (2 compartments), got {table_count}"
+        assert colgroup_count == table_count, (
+            f"Expected {table_count} <colgroup> tags (one per table), got {colgroup_count}"
+        )
+        expected_widths = ["28%", "14%", "14%", "30%", "14%"]
+        colgroups = re.findall(r'<colgroup>(.*?)</colgroup>', html, re.DOTALL)
+        for i, cg in enumerate(colgroups):
+            widths = re.findall(r'width:\s*(\d+%)', cg)
+            assert widths == expected_widths, (
+                f"Table {i+1} colgroup has widths {widths}, expected {expected_widths}"
+            )
+
     def test_heatmap_toggle_hidden_under_50(self, sample_report_data):
         html = generate_html_report(**sample_report_data)
         assert "show-all-toggle" not in html

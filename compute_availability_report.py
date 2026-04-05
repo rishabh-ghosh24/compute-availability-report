@@ -40,8 +40,8 @@ def parse_args(argv=None):
     parser.add_argument("--profile", default="DEFAULT", help="OCI config profile (default: DEFAULT)")
 
     # Reporting
-    parser.add_argument("--days", type=int, choices=[7, 14, 30, 60, 90],
-                        default=7, help="Reporting period in days (default: 7)")
+    parser.add_argument("--days", type=int, default=7,
+                        help="Reporting period in days, 1-90 (default: 7)")
     parser.add_argument("--sla-target", type=float, default=99.95,
                         help="SLA target %% (default: 99.95)")
     parser.add_argument("--running-only", action="store_true",
@@ -66,7 +66,14 @@ def parse_args(argv=None):
     parser.add_argument("--par-expiry-days", type=int, default=30,
                         help="PAR link expiry in days (default: 30)")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.days < 1 or args.days > 90:
+        parser.error(
+            "--days must be between 1 and 90. "
+            "OCI Monitoring retains metric data for a maximum of 90 days "
+            "(at hourly resolution)."
+        )
+    return args
 
 
 def setup_auth(args):
@@ -918,7 +925,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
 details:not([open]) > .comp-header::before {{ transform: rotate(-90deg); }}
 .comp-header .comp-count {{ color: #888780; font-weight: 400; }}
 .comp-header .comp-pct {{ color: #0f6e56; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }}
 th {{ text-align: left; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #888780; padding: 10px 16px; background: #faf9f6; border-bottom: 1px solid #e8e6df; }}
 th.center {{ text-align: center; }}
 td {{ padding: 12px 16px; border-bottom: 1px solid #f0efe9; }}
@@ -1046,9 +1053,7 @@ td.center {{ text-align: center; }}
 <div class="tbl-wrap">
 """)
 
-    # Table header row (only first compartment gets the header)
-    first_comp = True
-    for comp_id, group in grouped.items():
+    for comp_idx, (comp_id, group) in enumerate(grouped.items()):
         comp_name = group["name"]
         comp_instances = group["instances"]
 
@@ -1059,21 +1064,26 @@ td.center {{ text-align: center; }}
         comp_pct_color = "#0f6e56" if comp_pct is not None and comp_pct >= sla_target else "#a32d2d"
 
         # Compartment header — collapsible via <details>/<summary>
-        border_style = ' style="border-top:2px solid #e8e6df;"' if not first_comp else ''
+        border_style = ' style="border-top:2px solid #e8e6df;"' if comp_idx > 0 else ''
         parts.append(f'<details class="comp-section" open{border_style}>')
         parts.append(f'<summary class="comp-header">{html.escape(comp_name)} <span class="comp-count">({len(comp_instances)} instances)</span> &mdash; <span class="comp-pct" style="color:{comp_pct_color};">{comp_pct_str}</span></summary>')
 
         # Table
-        parts.append('<table>')
-        if first_comp:
-            parts.append("""<thead><tr>
-<th style="width:28%;">Instance</th>
-<th class="center" style="width:14%;">Status</th>
-<th style="width:14%;">Availability</th>
-<th class="center" style="width:30%;">Uptime</th>
-<th style="width:14%;">Downtime</th>
+        parts.append("""<table>
+<colgroup>
+<col style="width:28%;">
+<col style="width:14%;">
+<col style="width:14%;">
+<col style="width:30%;">
+<col style="width:14%;">
+</colgroup>""")
+        parts.append("""<thead><tr>
+<th>Instance</th>
+<th class="center">Status</th>
+<th>Availability</th>
+<th class="center">Uptime</th>
+<th>Downtime</th>
 </tr></thead>""")
-            first_comp = False
 
         parts.append('<tbody>')
         for inst in comp_instances:

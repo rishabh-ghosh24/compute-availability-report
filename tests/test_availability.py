@@ -30,10 +30,20 @@ class TestParseArgs:
         assert args.par_expiry_days == 30
 
     def test_days_validation(self):
-        """--days only accepts 7, 14, 30, 60, 90"""
+        """--days accepts any integer 1-90, rejects out of range"""
         from compute_availability_report import parse_args
+        # Valid values should work
+        assert parse_args(["--compartment-id", "ocid1.test", "--days", "1"]).days == 1
+        assert parse_args(["--compartment-id", "ocid1.test", "--days", "15"]).days == 15
+        assert parse_args(["--compartment-id", "ocid1.test", "--days", "45"]).days == 45
+        assert parse_args(["--compartment-id", "ocid1.test", "--days", "90"]).days == 90
+        # Out of range should fail
         with pytest.raises(SystemExit):
-            parse_args(["--compartment-id", "ocid1.test", "--days", "15"])
+            parse_args(["--compartment-id", "ocid1.test", "--days", "0"])
+        with pytest.raises(SystemExit):
+            parse_args(["--compartment-id", "ocid1.test", "--days", "-10"])
+        with pytest.raises(SystemExit):
+            parse_args(["--compartment-id", "ocid1.test", "--days", "91"])
 
     def test_all_flags(self):
         from compute_availability_report import parse_args
