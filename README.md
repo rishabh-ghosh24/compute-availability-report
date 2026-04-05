@@ -124,7 +124,7 @@ compute_availability_report.py [OPTIONS]
 | Flag | Description |
 |------|-------------|
 | `--title TEXT` | Custom title displayed in the top-right header area (e.g., "ACME Corp MSP"). |
-| `--logo PATH` | Path to a logo image file. Embedded as base64 in the report for offline use. |
+| `--logo PATH` | Path to a logo image file. Embedded as base64 in the report for offline use. Supported formats: PNG, JPG, SVG, GIF. Displayed at `max-height: 32px` in the top-right header — keep the file small (ideally under 50 KB). A transparent-background PNG or SVG works best. |
 
 ### Exclusions
 
