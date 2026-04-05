@@ -86,6 +86,11 @@ class TestHTMLReport:
         html = generate_html_report(**sample_report_data, title="ACME Corp")
         assert "ACME Corp" in html
 
+    def test_branding_title_html_escaped(self, sample_report_data):
+        html = generate_html_report(**sample_report_data, title="<ACME Corp>")
+        assert "&lt;ACME Corp&gt;" in html
+        assert "<ACME Corp>" not in html
+
     def test_branding_logo(self, sample_report_data):
         logo_data = "data:image/png;base64,iVBORw0KGgo="
         html = generate_html_report(**sample_report_data, logo_data=logo_data)

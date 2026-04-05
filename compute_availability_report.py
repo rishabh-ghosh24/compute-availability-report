@@ -901,11 +901,12 @@ def generate_html_report(instances, fleet, heatmap_data, all_hours,
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8f7f4; color: #1a1a1a; font-size: 14px; line-height: 1.5; }}
 .container {{ max-width: 960px; margin: 0 auto; padding: 32px 24px; }}
-.header {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 28px; }}
+.header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }}
 .header h1 {{ font-size: 22px; font-weight: 600; margin-bottom: 4px; }}
+.header-left {{ flex: 1; min-width: 0; }}
 .header-meta {{ font-size: 13px; color: #6b6b6b; display: flex; gap: 16px; flex-wrap: wrap; }}
-.header-brand {{ text-align: right; font-size: 11px; color: #b4b2a9; }}
-.header-brand .brand-title {{ font-weight: 500; font-size: 12px; color: #888780; }}
+.header-brand {{ text-align: right; flex-shrink: 0; margin-left: 24px; }}
+.header-brand .brand-title {{ font-weight: 600; font-size: 14px; color: #1a1a1a; }}
 .metrics {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }}
 .metric-card {{ background: #fff; border-radius: 10px; padding: 16px 20px; border: 1px solid #e8e6df; }}
 .metric-label {{ font-size: 12px; color: #888780; margin-bottom: 4px; }}
@@ -988,11 +989,11 @@ td.center {{ text-align: center; }}
         if logo_data:
             brand_parts.append(f'<img src="{logo_data}" alt="Logo" style="max-height:32px;margin-bottom:4px;">')
         if title:
-            brand_parts.append(f'<div class="brand-title">{title}</div>')
+            brand_parts.append(f'<div class="brand-title">{html.escape(title)}</div>')
         branding_html = f'<div class="header-brand">{"".join(brand_parts)}</div>'
 
     parts.append(f"""<div class="header">
-<div>
+<div class="header-left">
 <h1>Compute Availability Report</h1>
 <div class="header-meta">
 <span>Compartment: <strong>{compartment_name}</strong></span>
@@ -1433,7 +1434,10 @@ def sanitize_filename(name):
 
 def embed_logo(logo_path):
     """Read logo file and return base64-encoded data URI."""
-    if not logo_path or not os.path.isfile(logo_path):
+    if not logo_path:
+        return None
+    if not os.path.isfile(logo_path):
+        log.warning("Logo file not found: %s — skipping logo.", logo_path)
         return None
     ext = os.path.splitext(logo_path)[1].lower()
     mime_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
