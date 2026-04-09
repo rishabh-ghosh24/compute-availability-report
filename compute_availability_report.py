@@ -21,7 +21,7 @@ try:
 except ImportError:
     oci = None
 
-VERSION = "1.0"
+VERSION = "1.2"
 
 log = logging.getLogger("availability-report")
 
@@ -115,11 +115,11 @@ def make_client(client_class, config, signer):
     return client_class(config)
 
 
-def classify_hour(has_cpu, instance_status, query_failed=False):
-    """Classify an hourly bucket as up, down, stopped, or nodata.
+def classify_minute(has_cpu, instance_status, query_failed=False):
+    """Classify a per-minute bucket as up, down, stopped, or nodata.
 
     Args:
-        has_cpu: True if CpuUtilization data exists for this hour
+        has_cpu: True if CpuUtilization data exists for this minute
         instance_status: 0 (healthy), 1 (unhealthy), or None (no data)
         query_failed: True if the Monitoring API call failed for this scope
 
@@ -139,19 +139,19 @@ def classify_hour(has_cpu, instance_status, query_failed=False):
     return "stopped"
 
 
-def build_availability_matrix(instances, hourly_buckets, cpu_metrics, status_metrics,
+def build_availability_matrix(instances, time_buckets, cpu_metrics, status_metrics,
                                failed_instance_ids=None):
-    """Build availability matrix from metric data.
+    """Build availability matrix from metric data at minute granularity.
 
     Args:
         instances: list of instance dicts (need id) or list of instance ID strings
-        hourly_buckets: list of hour keys (ISO format strings)
-        cpu_metrics: {instance_id: {hour_key: value}} from CpuUtilization
-        status_metrics: {instance_id: {hour_key: value}} from instance_status
+        time_buckets: list of minute bucket keys (ISO format strings)
+        cpu_metrics: {instance_id: {minute_key: value}} from CpuUtilization
+        status_metrics: {instance_id: {minute_key: value}} from instance_status
         failed_instance_ids: set of instance OCIDs where metric queries failed
 
     Returns:
-        {instance_id: {hour_key: "up"|"down"|"stopped"|"nodata"}}
+        {instance_id: {minute_key: "up"|"down"|"stopped"|"nodata"}}
     """
     failed_instance_ids = failed_instance_ids or set()
     matrix = {}
@@ -161,53 +161,52 @@ def build_availability_matrix(instances, hourly_buckets, cpu_metrics, status_met
 
         inst_cpu = cpu_metrics.get(inst_id, {})
         inst_status = status_metrics.get(inst_id, {})
-        hourly = {}
-        for hour in hourly_buckets:
-            has_cpu = hour in inst_cpu
-            status_val = inst_status.get(hour)
+        minutely = {}
+        for bucket in time_buckets:
+            has_cpu = bucket in inst_cpu
+            status_val = inst_status.get(bucket)
             if status_val is not None:
                 status_val = int(status_val)
-            hourly[hour] = classify_hour(has_cpu, status_val, query_failed=query_failed)
-        matrix[inst_id] = hourly
+            minutely[bucket] = classify_minute(has_cpu, status_val, query_failed=query_failed)
+        matrix[inst_id] = minutely
     return matrix
 
 
-def compute_instance_stats(hourly_statuses):
-    """Compute availability stats from hourly classification dict.
+def compute_instance_stats(minute_statuses):
+    """Compute availability stats from per-minute classification dict.
 
     Args:
-        hourly_statuses: dict of {hour_key: "up"|"down"|"stopped"|"nodata"}
+        minute_statuses: dict of {minute_key: "up"|"down"|"stopped"|"nodata"}
 
     Returns:
-        dict with up_hours, down_hours, stopped_hours, nodata_hours,
-        monitored_hours, total_hours, availability_pct (float or None),
+        dict with up_minutes, down_minutes, stopped_minutes, nodata_minutes,
+        monitored_minutes, total_minutes, availability_pct (float or None),
         downtime_minutes, data_complete
     """
-    up = sum(1 for v in hourly_statuses.values() if v == "up")
-    down = sum(1 for v in hourly_statuses.values() if v == "down")
-    stopped = sum(1 for v in hourly_statuses.values() if v == "stopped")
-    nodata = sum(1 for v in hourly_statuses.values() if v == "nodata")
+    up = sum(1 for v in minute_statuses.values() if v == "up")
+    down = sum(1 for v in minute_statuses.values() if v == "down")
+    stopped = sum(1 for v in minute_statuses.values() if v == "stopped")
+    nodata = sum(1 for v in minute_statuses.values() if v == "nodata")
     monitored = up + down
-    total = len(hourly_statuses)
+    total = len(minute_statuses)
     data_complete = nodata == 0
 
     if nodata > 0:
-        # Any nodata hours -> availability is unreliable, show N/A
         availability_pct = None
     elif monitored == 0:
         availability_pct = None
     else:
-        availability_pct = round(up / monitored * 100, 2)
+        availability_pct = round(up / monitored * 100, 4)
 
     return {
-        "up_hours": up,
-        "down_hours": down,
-        "stopped_hours": stopped,
-        "nodata_hours": nodata,
-        "monitored_hours": monitored,
-        "total_hours": total,
+        "up_minutes": up,
+        "down_minutes": down,
+        "stopped_minutes": stopped,
+        "nodata_minutes": nodata,
+        "monitored_minutes": monitored,
+        "total_minutes": total,
         "availability_pct": availability_pct,
-        "downtime_minutes": down * 60,
+        "downtime_minutes": down,   # exact — no * 60 approximation
         "data_complete": data_complete,
     }
 
@@ -215,7 +214,7 @@ def compute_instance_stats(hourly_statuses):
 def compute_compartment_stats(instances_in_compartment, sla_target):
     """Compute availability stats for a single compartment.
 
-    If ANY instance in the compartment has data_complete=False (nodata hours),
+    If ANY instance in the compartment has data_complete=False (nodata minutes),
     compartment_availability_pct and at_target_count both become None (fail closed).
 
     Args:
@@ -225,8 +224,8 @@ def compute_compartment_stats(instances_in_compartment, sla_target):
     Returns:
         dict with instance_count, compartment_availability_pct, at_target_count, data_complete
     """
-    total_up = sum(s["up_hours"] for s in instances_in_compartment)
-    total_monitored = sum(s["monitored_hours"] for s in instances_in_compartment)
+    total_up = sum(s["up_minutes"] for s in instances_in_compartment)
+    total_monitored = sum(s["monitored_minutes"] for s in instances_in_compartment)
     all_complete = all(s.get("data_complete", True) for s in instances_in_compartment)
 
     if not all_complete or total_monitored == 0:
@@ -237,7 +236,7 @@ def compute_compartment_stats(instances_in_compartment, sla_target):
             "data_complete": all_complete,
         }
 
-    pct = round(total_up / total_monitored * 100, 2)
+    pct = round(total_up / total_monitored * 100, 4)
     at_target = sum(
         1 for s in instances_in_compartment
         if s["availability_pct"] is not None and s["availability_pct"] >= sla_target
@@ -259,7 +258,7 @@ def compute_fleet_stats(instance_stats_list, sla_target, discovery_warnings=None
     - Any discovery_warnings -> discovery_complete=False
     - report_complete = data_complete AND discovery_complete
     - If report_complete=False: fleet_availability_pct, at_target_count,
-      total_up_hours, total_monitored_hours all become None
+      total_up_minutes, total_monitored_minutes all become None
     - discovered_instance_count always stays numeric for diagnostics
 
     Args:
@@ -269,18 +268,16 @@ def compute_fleet_stats(instance_stats_list, sla_target, discovery_warnings=None
 
     Returns:
         dict with discovered_instance_count, fleet_availability_pct,
-        at_target_count, total_up_hours, total_monitored_hours,
+        at_target_count, total_up_minutes, total_monitored_minutes,
         data_complete, discovery_complete, report_complete
     """
     discovery_warnings = discovery_warnings or []
-    total_up = sum(s["up_hours"] for s in instance_stats_list)
-    total_monitored = sum(s["monitored_hours"] for s in instance_stats_list)
+    total_up = sum(s["up_minutes"] for s in instance_stats_list)
+    total_monitored = sum(s["monitored_minutes"] for s in instance_stats_list)
     data_complete = all(s.get("data_complete", True) for s in instance_stats_list)
     discovery_complete = len(discovery_warnings) == 0
     report_complete = data_complete and discovery_complete
 
-    # Only count instances with computable availability toward SLA target
-    # Stopped instances (availability_pct=None, monitored_hours=0) are excluded
     monitorable = [s for s in instance_stats_list if s["availability_pct"] is not None]
     monitorable_count = len(monitorable)
 
@@ -290,14 +287,14 @@ def compute_fleet_stats(instance_stats_list, sla_target, discovery_warnings=None
             "monitorable_count": monitorable_count,
             "fleet_availability_pct": None,
             "at_target_count": None,
-            "total_up_hours": None if not report_complete else total_up,
-            "total_monitored_hours": None if not report_complete else total_monitored,
+            "total_up_minutes": None if not report_complete else total_up,
+            "total_monitored_minutes": None if not report_complete else total_monitored,
             "data_complete": data_complete,
             "discovery_complete": discovery_complete,
             "report_complete": report_complete,
         }
 
-    fleet_pct = round(total_up / total_monitored * 100, 2)
+    fleet_pct = round(total_up / total_monitored * 100, 4)
     at_target = sum(
         1 for s in monitorable
         if s["availability_pct"] >= sla_target
@@ -308,8 +305,8 @@ def compute_fleet_stats(instance_stats_list, sla_target, discovery_warnings=None
         "monitorable_count": monitorable_count,
         "fleet_availability_pct": fleet_pct,
         "at_target_count": at_target,
-        "total_up_hours": total_up,
-        "total_monitored_hours": total_monitored,
+        "total_up_minutes": total_up,
+        "total_monitored_minutes": total_monitored,
         "data_complete": data_complete,
         "discovery_complete": discovery_complete,
         "report_complete": report_complete,
@@ -317,15 +314,40 @@ def compute_fleet_stats(instance_stats_list, sla_target, discovery_warnings=None
 
 
 def get_heatmap_resolution(days):
-    """Return (block_hours, label) for adaptive heatmap resolution."""
-    if days <= 7:
-        return 1, "1 hour"
+    """Return (block_minutes, label) for adaptive heatmap display resolution.
+
+    The underlying data is always at 1-minute granularity.
+    This controls how many minutes each visual block represents.
+
+    Days range -> block size:
+      1         -> 15 min
+      2         -> 30 min
+      3–4       -> 15 min
+      5–7       -> 30 min
+      8–14      ->  1 hour  (60 min)
+      15–21     ->  2 hours (120 min)
+      22–45     ->  6 hours (360 min)
+      46–60     -> 12 hours (720 min)
+      61–90     ->  1 day   (1440 min)
+    """
+    if days <= 1:
+        return 15,   "15 minutes"
+    elif days <= 2:
+        return 30,   "30 minutes"
+    elif days <= 4:
+        return 15,   "15 minutes"
+    elif days <= 7:
+        return 30,   "30 minutes"
     elif days <= 14:
-        return 4, "4 hours"
-    elif days <= 30:
-        return 6, "6 hours"
+        return 60,   "1 hour"
+    elif days <= 21:
+        return 120,  "2 hours"
+    elif days <= 45:
+        return 360,  "6 hours"
+    elif days <= 60:
+        return 720,  "12 hours"
     else:
-        return 24, "1 day"
+        return 1440, "1 day"
 
 
 def _build_ancestor_path(compartment_map, comp_id, max_depth=10):
@@ -544,7 +566,6 @@ def group_instances_by_compartment(instances):
     return OrderedDict(sorted(groups.items(), key=lambda x: x[1]["name"]))
 
 
-DATAPOINT_LIMIT = 80_000  # safety margin below 100K API limit
 
 # Retry configuration for transient API errors (429 TooManyRequests, 5xx).
 # 400 errors are not retried — they indicate a query bug, not a transient fault.
@@ -556,34 +577,36 @@ RETRY_BACKOFF = 2  # seconds; doubles each attempt (2s, 4s, 8s)
 STATUS_CALL_THROTTLE_SECS = 0.05
 
 
-def build_hourly_buckets(start_time, end_time):
-    """Build list of hourly bucket keys (ISO format, UTC) for the reporting period."""
+def build_time_buckets(start_time, end_time, resolution="1m"):
+    """Build list of time bucket keys (ISO format, UTC) for the reporting period.
+
+    Args:
+        start_time: datetime, start of reporting window
+        end_time: datetime, end of reporting window
+        resolution: "1m" for per-minute buckets, "1h" for per-hour buckets
+
+    Returns:
+        list of ISO format timestamp strings
+    """
     buckets = []
     current = start_time
+    delta = timedelta(minutes=1) if resolution == "1m" else timedelta(hours=1)
     while current < end_time:
         buckets.append(current.strftime("%Y-%m-%dT%H:%M:%SZ"))
-        current += timedelta(hours=1)
+        current += delta
     return buckets
 
 
-def calculate_batch_groups(instance_ids, hours):
-    """Split instance IDs into batches to stay under API data point limit.
+def get_metric_resolution():
+    """Always use 1m resolution for maximum precision.
 
-    Args:
-        instance_ids: list of instance OCIDs
-        hours: number of hourly buckets in the reporting period
+    OCI constrains each query window to 7 days at 1m resolution.
+    collect_all_metrics handles chunking automatically.
 
     Returns:
-        list of lists, each sub-list is a batch of instance IDs
+        "1m"
     """
-    if not instance_ids:
-        return []
-
-    max_per_batch = max(1, DATAPOINT_LIMIT // hours)
-    batches = []
-    for i in range(0, len(instance_ids), max_per_batch):
-        batches.append(instance_ids[i:i + max_per_batch])
-    return batches
+    return "1m"
 
 
 def is_tenancy_ocid(ocid):
@@ -592,7 +615,8 @@ def is_tenancy_ocid(ocid):
 
 
 def collect_metrics(monitoring_client, compartment_id, namespace, metric_name,
-                    start_time, end_time, use_subtree=False, instance_ids=None):
+                    start_time, end_time, use_subtree=False, instance_ids=None,
+                    resolution="1m"):
     """Query SummarizeMetricsData for a metric across instances.
 
     Args:
@@ -600,23 +624,25 @@ def collect_metrics(monitoring_client, compartment_id, namespace, metric_name,
         compartment_id: compartment OCID for the query
         namespace: metric namespace (e.g. "oci_computeagent")
         metric_name: metric name (e.g. "CpuUtilization")
-        start_time: datetime, start of reporting window
-        end_time: datetime, end of reporting window
+        start_time: datetime, start of query window (max 7-day span for 1m resolution)
+        end_time: datetime, end of query window
         use_subtree: only set True when compartment_id is tenancy root OCID
         instance_ids: optional list of instance OCIDs to filter by
+        resolution: OCI resolution string e.g. "1m" or "1h"
 
     Returns:
         (metrics_dict, failed) tuple:
-        - metrics_dict: {instance_ocid: {hour_key: value}}
+        - metrics_dict: {instance_ocid: {minute_key: value}}
         - failed: bool, True if the API call failed
     """
+    interval = resolution  # interval == resolution for our use case
     if instance_ids:
         resource_filter = " || ".join(
             f'resourceId = "{rid}"' for rid in instance_ids
         )
-        query = f"{metric_name}[1h]{{{resource_filter}}}.max()"
+        query = f"{metric_name}[{interval}]{{{resource_filter}}}.max()"
     else:
-        query = f"{metric_name}[1h].max()"
+        query = f"{metric_name}[{interval}].max()"
 
     import time as _time
     last_exc = None
@@ -629,7 +655,7 @@ def collect_metrics(monitoring_client, compartment_id, namespace, metric_name,
                     query=query,
                     start_time=start_time.isoformat(),
                     end_time=end_time.isoformat(),
-                    resolution="1h",
+                    resolution=resolution,
                 ),
                 compartment_id_in_subtree=use_subtree,
             ).data
@@ -669,101 +695,117 @@ def collect_metrics(monitoring_client, compartment_id, namespace, metric_name,
             metrics_by_instance[resource_id] = {}
 
         for dp in metric_data.aggregated_datapoints:
-            hour_key = dp.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
-            metrics_by_instance[resource_id][hour_key] = dp.value
+            key = dp.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+            metrics_by_instance[resource_id][key] = dp.value
 
     return metrics_by_instance, False
 
 
 def collect_all_metrics(monitoring_client, root_compartment_id, compartment_map,
                         instances, start_time, end_time):
-    """Collect CpuUtilization and instance_status for all instances.
+    """Collect CpuUtilization and instance_status for all instances at 1m resolution.
 
-    Query strategy:
-    - CpuUtilization: batched with || filter at compartment scope; unfiltered when
-      the whole fleet fits in a single datapoint batch at tenancy scope.
-    - instance_status: one API call per instance at all scopes (|| filter rejected
-      by OCI Monitoring regardless of scope).
-    - Tenancy OCID + fits in one CPU batch: single unfiltered subtree=True CPU query;
-      one-per-instance subtree=True status queries.
-    - Otherwise: per-compartment queries (subtree=False) for both metrics.
+    Chunking strategy:
+    - OCI limits a single 1m-resolution query to a 7-day window span.
+    - We split the full date range into ≤7-day chunks and query each chunk
+      separately, then merge. This allows minute-level precision for any
+      --days value up to 90.
+    - Within each chunk, CPU is batched by datapoint limit; instance_status
+      is queried one instance at a time (OCI rejects || filters for it).
 
     Returns:
         (cpu_metrics, status_metrics, failed_instance_ids) where:
-        - cpu_metrics: {instance_ocid: {hour_key: value}}
-        - status_metrics: {instance_ocid: {hour_key: value}}
+        - cpu_metrics: {instance_ocid: {minute_key: value}}
+        - status_metrics: {instance_ocid: {minute_key: value}}
         - failed_instance_ids: set of instance OCIDs where metric queries failed
     """
     import time as _time
-    hours = int((end_time - start_time).total_seconds() / 3600)
+
+    RESOLUTION = "1m"
+    MAX_CHUNK_DAYS = 7  # OCI 1m resolution window limit
+
     cpu_metrics = {}
     status_metrics = {}
     failed_instance_ids = set()
 
+    # Build ≤7-day chunks covering the full reporting window
+    chunks = []
+    chunk_start = start_time
+    while chunk_start < end_time:
+        chunk_end = min(chunk_start + timedelta(days=MAX_CHUNK_DAYS), end_time)
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end
+
+    log.info(f"Querying metrics in {len(chunks)} chunk(s) of up to {MAX_CHUNK_DAYS} days "
+             f"at {RESOLUTION} resolution.")
+
     use_subtree = is_tenancy_ocid(root_compartment_id)
 
-    if use_subtree:
-        all_ids = [inst["id"] for inst in instances]
-        if len(calculate_batch_groups(all_ids, hours)) > 1:
-            # OCI Monitoring rejects multi-resourceId || filters when
-            # compartment_id_in_subtree=True, and batching requires those filters.
-            # Fall back to per-compartment queries.
-            log.info("Instance count requires batching; switching to per-compartment metric queries.")
-            use_subtree = False
+    for chunk_idx, (c_start, c_end) in enumerate(chunks):
+        chunk_minutes = int((c_end - c_start).total_seconds() / 60)
+        log.info(f"Chunk {chunk_idx + 1}/{len(chunks)}: "
+                 f"{c_start.strftime('%Y-%m-%d %H:%M')} → {c_end.strftime('%Y-%m-%d %H:%M')} "
+                 f"({chunk_minutes} minutes)")
 
-    if use_subtree:
-        # Tenancy-wide: single query with subtree (fits in one batch, no resourceId filter needed)
-        scopes = [(root_compartment_id, True)]
-    else:
-        # Per-compartment queries
-        scopes = [(comp_id, False) for comp_id in compartment_map.keys()]
-
-    for comp_id, subtree in scopes:
-        # Determine instances in this scope
-        if subtree:
-            scope_instance_ids = [inst["id"] for inst in instances]
+        # Determine scope (tenancy-wide subtree vs per-compartment)
+        # At 1m resolution OCI rejects || filters, so all queries are
+        # one-per-instance. Subtree=True is safe for tenancy-wide scope
+        # since no batching filter is needed.
+        if use_subtree:
+            _use_subtree = True
         else:
-            scope_instance_ids = [inst["id"] for inst in instances
-                                  if inst["compartment_id"] == comp_id]
-        if not scope_instance_ids:
-            continue
+            _use_subtree = False
 
-        # ── CpuUtilization: batch by datapoint limit (unchanged behaviour) ──────────
-        # || filter works at compartment scope; unfiltered call used when fleet fits
-        # in a single batch at tenancy scope.
-        cpu_batches = calculate_batch_groups(scope_instance_ids, hours)
-        for batch in cpu_batches:
-            log.info(f"Querying CpuUtilization for batch of {len(batch)} instance(s) "
-                     f"in {comp_id[:30]}...")
-            batch_cpu, cpu_failed = collect_metrics(
-                monitoring_client, comp_id,
-                "oci_computeagent", "CpuUtilization",
-                start_time, end_time,
-                use_subtree=subtree,
-                instance_ids=batch if len(cpu_batches) > 1 else None,
-            )
-            cpu_metrics.update(batch_cpu)
-            if cpu_failed:
-                # Mark all instances in this CPU batch as failed
-                failed_instance_ids.update(batch)
+        if _use_subtree:
+            scopes = [(root_compartment_id, True)]
+        else:
+            scopes = [(comp_id, False) for comp_id in compartment_map.keys()]
 
-        # ── instance_status: one call per instance ───────────────────────────────────
-        # OCI Monitoring rejects multi-resourceId || filters for instance_status at
-        # ALL scopes (tenancy and compartment). Query one instance at a time.
-        for inst_id in scope_instance_ids:
-            _time.sleep(STATUS_CALL_THROTTLE_SECS)  # throttle to avoid sustained 429s
-            log.info(f"Querying instance_status for {inst_id[:30]}...")
-            batch_status, status_failed = collect_metrics(
-                monitoring_client, comp_id,
-                "oci_compute_infrastructure_health", "instance_status",
-                start_time, end_time,
-                use_subtree=subtree,
-                instance_ids=[inst_id],
-            )
-            status_metrics.update(batch_status)
-            if status_failed:
-                # Only this instance failed; others in the scope are unaffected
-                failed_instance_ids.add(inst_id)
+        for comp_id, subtree in scopes:
+            if subtree:
+                scope_instance_ids = [inst["id"] for inst in instances]
+            else:
+                scope_instance_ids = [inst["id"] for inst in instances
+                                      if inst["compartment_id"] == comp_id]
+            if not scope_instance_ids:
+                continue
+
+            # ── CpuUtilization: one call per instance ───────────────────────
+            # OCI rejects multi-resourceId || filters at 1m resolution
+            # ("Not Supported yet"), so we query one instance at a time,
+            # matching the same pattern used for instance_status.
+            for inst_id in scope_instance_ids:
+                _time.sleep(STATUS_CALL_THROTTLE_SECS)
+                log.info(f"  CPU for {inst_id[:30]}...")
+                inst_cpu, cpu_failed = collect_metrics(
+                    monitoring_client, comp_id,
+                    "oci_computeagent", "CpuUtilization",
+                    c_start, c_end,
+                    use_subtree=subtree,
+                    instance_ids=[inst_id],
+                    resolution=RESOLUTION,
+                )
+                for iid, dp_map in inst_cpu.items():
+                    cpu_metrics.setdefault(iid, {}).update(dp_map)
+                if cpu_failed:
+                    failed_instance_ids.add(inst_id)
+
+            # ── instance_status: one call per instance ───────────────────────
+            for inst_id in scope_instance_ids:
+                _time.sleep(STATUS_CALL_THROTTLE_SECS)
+                log.info(f"  instance_status for {inst_id[:30]}...")
+                batch_status, status_failed = collect_metrics(
+                    monitoring_client, comp_id,
+                    "oci_compute_infrastructure_health", "instance_status",
+                    c_start, c_end,
+                    use_subtree=subtree,
+                    instance_ids=[inst_id],
+                    resolution=RESOLUTION,
+                )
+                for iid, dp_map in batch_status.items():
+                    status_metrics.setdefault(iid, {}).update(dp_map)
+                if status_failed:
+                    failed_instance_ids.add(inst_id)
 
     return cpu_metrics, status_metrics, failed_instance_ids
 
@@ -808,7 +850,7 @@ def _format_number(n):
     return f"{n:,}"
 
 
-def generate_html_report(instances, fleet, heatmap_data, all_hours,
+def generate_html_report(instances, fleet, heatmap_data, all_buckets,
                          compartment_name, region, days, sla_target,
                          start_date, end_date, title=None, logo_data=None,
                          discovery_warnings=None):
@@ -817,8 +859,8 @@ def generate_html_report(instances, fleet, heatmap_data, all_hours,
     Args:
         instances: list of instance dicts (with stats merged in)
         fleet: fleet stats dict from compute_fleet_stats
-        heatmap_data: {instance_id: [status_per_bucket]} for heatmap blocks
-        all_hours: list of hourly bucket keys (ISO format)
+        heatmap_data: {instance_id: [status_per_minute_bucket]}
+        all_buckets: list of minute bucket keys (ISO format)
         compartment_name: root compartment display name
         region: OCI region string
         days: reporting period in days
@@ -841,8 +883,8 @@ def generate_html_report(instances, fleet, heatmap_data, all_hours,
     # Fleet values
     fleet_pct = fleet.get("fleet_availability_pct")
     at_target = fleet.get("at_target_count")
-    total_up = fleet.get("total_up_hours")
-    total_mon = fleet.get("total_monitored_hours")
+    total_up = fleet.get("total_up_minutes")
+    total_mon = fleet.get("total_monitored_minutes")
     inst_count = fleet.get("discovered_instance_count", len(instances))
 
     # Format fleet availability for display
@@ -858,23 +900,30 @@ def generate_html_report(instances, fleet, heatmap_data, all_hours,
         fleet_pct_str = "N/A"
         fleet_color = "#888780"
 
-    # Instances card value
-    if not discovery_complete:
-        inst_value = f"{inst_count} (partial scope)"
-    else:
-        inst_value = str(inst_count)
-
+    # Instances card value — show monitorable (had uptime) vs total discovered
     # Meeting SLA card — denominator is monitorable instances only
     # (excludes stopped/N/A instances that have no computable availability)
     monitorable_count = fleet.get("monitorable_count", inst_count)
+    if not discovery_complete:
+        inst_value = f"{monitorable_count} active / {inst_count} total (partial scope)"
+    else:
+        inst_value = f"{monitorable_count} active / {inst_count} total"
     if at_target is not None:
         sla_value = f"{at_target} / {monitorable_count}"
     else:
         sla_value = "N/A"
 
-    # Total uptime card
+    # Total uptime card — show as hours for readability
+    def fmt_minutes(m):
+        if m is None:
+            return "N/A"
+        if m < 60:
+            return f"{m}m"
+        h, rem = divmod(m, 60)
+        return f"{_format_number(h)}h {rem}m" if rem else f"{_format_number(h)}h"
+
     if total_up is not None and total_mon is not None:
-        uptime_value = f"{_format_number(total_up)} / {_format_number(total_mon)}"
+        uptime_value = f"{fmt_minutes(total_up)} / {fmt_minutes(total_mon)}"
     else:
         uptime_value = "N/A"
 
@@ -882,7 +931,7 @@ def generate_html_report(instances, fleet, heatmap_data, all_hours,
     grouped = group_instances_by_compartment(instances)
 
     # Heatmap resolution
-    block_hours, resolution_label = get_heatmap_resolution(days)
+    block_minutes, resolution_label = get_heatmap_resolution(days)
 
     # Generation timestamp
     gen_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -955,14 +1004,49 @@ td.center {{ text-align: center; }}
 .heatmap-label {{ width: 200px; flex-shrink: 0; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
 .heatmap-pct {{ width: 52px; flex-shrink: 0; font-size: 12px; text-align: right; padding-right: 10px; font-weight: 500; }}
 .heatmap-blocks {{ display: flex; gap: 1px; flex: 1; }}
-.hblk {{ height: 24px; flex: 1; border-radius: 1.5px; cursor: pointer; }}
+.hblk {{ height: 28px; flex: 1; border-radius: 2px; cursor: default; transition: opacity 0.1s, transform 0.1s; position: relative; }}
+.hblk:hover {{ opacity: 0.85; transform: scaleY(1.15); z-index: 2; }}
 .hblk-up {{ background: #1d9e75; }}
 .hblk-down {{ background: #e24b4a; }}
 .hblk-nodata {{ background: #ef9f27; }}
-.hblk-stopped {{ background: #e8e6df; }}
+.hblk-stopped {{ background: #d1d0ca; }}
 .legend {{ display: flex; gap: 16px; align-items: center; font-size: 12px; color: #888780; margin: 12px 0 0; }}
 .legend-block {{ display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 4px; }}
-.tooltip {{ position: fixed; background: #2c2c2a; color: #fff; font-size: 11px; padding: 4px 8px; border-radius: 4px; display: none; pointer-events: none; z-index: 1000; white-space: nowrap; }}
+.tooltip {{
+  position: fixed;
+  background: #1c1c1a;
+  color: #e8e5dc;
+  font-size: 12px;
+  padding: 12px 16px;
+  border-radius: 8px;
+  display: none;
+  pointer-events: none;
+  z-index: 9999;
+  white-space: normal;
+  max-width: 300px;
+  min-width: 200px;
+  line-height: 1.55;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.3);
+  border: 1px solid rgba(255,255,255,0.08);
+}}
+.tooltip-arrow {{
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0; height: 0;
+}}
+.tooltip-arrow-down {{
+  bottom: -7px;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top: 7px solid #1c1c1a;
+}}
+.tooltip-arrow-up {{
+  top: -7px;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-bottom: 7px solid #1c1c1a;
+}}
 .hidden {{ display: none !important; }}
 .show-all-btn {{ background: #fff; border: 1px solid #e8e6df; border-radius: 6px; padding: 6px 14px; font-size: 12px; color: #888780; cursor: pointer; margin-top: 8px; }}
 .show-all-btn:hover {{ background: #faf9f6; }}
@@ -999,6 +1083,7 @@ td.center {{ text-align: center; }}
 <span>Compartment: <strong>{compartment_name}</strong></span>
 <span>Region: <strong>{region}</strong></span>
 <span>Period: <strong>{start_date} &mdash; {end_date} ({days} days)</strong></span>
+
 <span>SLA target: <strong>{sla_target}%</strong></span>
 </div>
 </div>
@@ -1022,7 +1107,7 @@ td.center {{ text-align: center; }}
 </div>
 <div class="metric-card">
 <div class="metric-label">Instances monitored</div>
-<div class="metric-value">{inst_value}</div>
+<div class="metric-value" style="font-size:18px;">{inst_value}</div>
 </div>
 <div class="metric-card">
 <div class="metric-label">Meeting SLA target</div>
@@ -1032,6 +1117,15 @@ td.center {{ text-align: center; }}
 <div class="metric-label">Total uptime hours</div>
 <div class="metric-value">{uptime_value}</div>
 </div>
+</div>
+""")
+
+    # Unmeasured instances info banner
+    unmeasured = inst_count - monitorable_count
+    if unmeasured > 0:
+        parts.append(f"""<div style="background:#f0f4ff;border-left:4px solid #4a7cc7;padding:12px 16px;border-radius:0 6px 6px 0;margin-bottom:20px;font-size:13px;color:#1e3a6e;display:flex;align-items:center;gap:8px;">
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" style="flex-shrink:0;"><circle cx="8" cy="8" r="7" stroke="#4a7cc7" stroke-width="1.5" fill="#f0f4ff"/><text x="8" y="12" text-anchor="middle" font-size="10" font-weight="700" fill="#1e3a6e">i</text></svg>
+<span><strong>{unmeasured} of {inst_count} instances</strong> had no uptime during this period (always stopped) and are excluded from fleet availability calculations &mdash; shown as <strong>N/A</strong>. Fleet availability reflects the <strong>{monitorable_count} active instance(s)</strong> only.</span>
 </div>
 """)
 
@@ -1089,12 +1183,13 @@ td.center {{ text-align: center; }}
         parts.append('<tbody>')
         for inst in comp_instances:
             name = inst["name"]
+            inst_id = inst["id"]
             state = inst.get("state", "UNKNOWN")
             avail = inst.get("availability_pct")
-            up_h = inst.get("up_hours", 0)
-            down_h = inst.get("down_hours", 0)
-            stopped_h = inst.get("stopped_hours", 0)
-            monitored_h = inst.get("monitored_hours", 0)
+            up_m = inst.get("up_minutes", 0)
+            down_m = inst.get("down_minutes", 0)
+            stopped_m = inst.get("stopped_minutes", 0)
+            monitored_m = inst.get("monitored_minutes", 0)
             downtime_min = inst.get("downtime_minutes", 0)
 
             # Dot color
@@ -1115,8 +1210,11 @@ td.center {{ text-align: center; }}
 
             # Availability color
             if avail is not None:
-                avail_str = f"{avail:.2f}%" if avail < 100 else "100%"
-                if avail >= sla_target:
+                avail_str = f"{avail:.4f}%" if avail < 100 else "100%"
+                if state == "STOPPED":
+                    # Grey out stopped instances — green 100% on a stopped instance is misleading
+                    avail_color = "#888780"
+                elif avail >= sla_target:
                     avail_color = "#0f6e56"
                 elif avail >= 99.0:
                     avail_color = "#633806"
@@ -1127,11 +1225,11 @@ td.center {{ text-align: center; }}
                 avail_color = "#888780"
 
             # Uptime bar proportions
-            total_h = up_h + down_h + stopped_h
-            if total_h > 0:
-                up_pct = up_h / total_h * 100
-                down_pct = down_h / total_h * 100
-                stopped_pct = stopped_h / total_h * 100
+            total_m = up_m + down_m + stopped_m
+            if total_m > 0:
+                up_pct = up_m / total_m * 100
+                down_pct = down_m / total_m * 100
+                stopped_pct = stopped_m / total_m * 100
             else:
                 up_pct = 100
                 down_pct = 0
@@ -1146,15 +1244,23 @@ td.center {{ text-align: center; }}
             if stopped_pct > 0:
                 bar_segments.append(f'<div class="bar-stopped" style="width:{stopped_pct:.1f}%;"></div>')
 
-            # Downtime color
+            # Downtime display
             dt_color = "#a32d2d" if downtime_min > 0 else "inherit"
+            if downtime_min >= 60:
+                h2, rem2 = divmod(downtime_min, 60)
+                dt_str = f"{h2}h {rem2}m" if rem2 else f"{h2}h"
+            else:
+                dt_str = f"{downtime_min} min"
+
+            # Uptime display
+            up_h_display = f"{up_m // 60}h {up_m % 60}m" if up_m >= 60 else f"{up_m}m"
 
             parts.append(f"""<tr>
-<td><span class="dot {dot_cls}"></span>{html.escape(name)}</td>
+<td><span class="dot {dot_cls}"></span><span class="inst-name" data-ocid="{html.escape(inst_id, quote=True)}" style="cursor:default;border-bottom:1px dotted #b4b2a9;">{html.escape(name)}</span></td>
 <td class="center"><span class="badge {badge_cls}">{html.escape(state)}</span></td>
 <td style="font-weight:600;color:{avail_color};">{avail_str}</td>
-<td class="center"><div class="uptime-cell"><span class="uptime-hours">{up_h}h</span><div class="avail-bar">{"".join(bar_segments)}</div></div></td>
-<td style="color:{dt_color};">{downtime_min} min</td>
+<td class="center"><div class="uptime-cell"><span class="uptime-hours">{up_h_display}</span><div class="avail-bar">{"".join(bar_segments)}</div></div></td>
+<td style="color:{dt_color};">{dt_str}</td>
 </tr>""")
 
         parts.append('</tbody></table>')
@@ -1164,14 +1270,14 @@ td.center {{ text-align: center; }}
 
     # Section E: HEATMAP
     parts.append('<div class="heatmap-section">')
-    parts.append('<div class="section-title">Hourly availability heatmap</div>')
+    parts.append('<div class="section-title">Availability heatmap</div>')
 
     # Date markers
-    if all_hours:
+    if all_buckets:
         from datetime import datetime as _dt
-        first_hour = _dt.strptime(all_hours[0], "%Y-%m-%dT%H:%M:%SZ")
-        last_hour = _dt.strptime(all_hours[-1], "%Y-%m-%dT%H:%M:%SZ")
-        total_span = (last_hour - first_hour).days
+        first_bucket = _dt.strptime(all_buckets[0], "%Y-%m-%dT%H:%M:%SZ")
+        last_bucket = _dt.strptime(all_buckets[-1], "%Y-%m-%dT%H:%M:%SZ")
+        total_span = (last_bucket - first_bucket).days
         date_labels = []
         if total_span <= 7:
             step = 1
@@ -1181,11 +1287,11 @@ td.center {{ text-align: center; }}
             step = 5
         else:
             step = 7
-        d = first_hour
-        while d <= last_hour:
+        d = first_bucket
+        while d <= last_bucket:
             date_labels.append(f"{d.strftime('%b')} {d.day}")
             d += timedelta(days=step)
-        last_label = f"{last_hour.strftime('%b')} {last_hour.day}"
+        last_label = f"{last_bucket.strftime('%b')} {last_bucket.day}"
         if date_labels and last_label != date_labels[-1]:
             date_labels.append(last_label)
 
@@ -1213,9 +1319,12 @@ td.center {{ text-align: center; }}
             statuses = heatmap_data.get(inst_id, [])
 
             # Availability color for heatmap
+            inst_state = inst.get("state", "")
             if avail is not None:
-                pct_str = f"{avail:.1f}%" if avail < 100 else "100%"
-                if avail >= sla_target:
+                pct_str = f"{avail:.2f}%" if avail < 100 else "100%"
+                if inst_state == "STOPPED":
+                    pct_color = "#888780"
+                elif avail >= sla_target:
                     pct_color = "#0f6e56"
                 elif avail >= 99.0:
                     pct_color = "#633806"
@@ -1231,19 +1340,38 @@ td.center {{ text-align: center; }}
                 if avail is not None and avail >= sla_target:
                     row_hidden = " heatmap-hidden hidden"
 
-            # Aggregate blocks
+            # Aggregate blocks — each block covers block_minutes minutes
             blocks = []
             num_buckets = len(statuses)
-            for b_start in range(0, num_buckets, block_hours):
-                chunk = statuses[b_start:b_start + block_hours]
+            for b_start in range(0, num_buckets, block_minutes):
+                chunk = statuses[b_start:b_start + block_minutes]
                 agg = _aggregate_heatmap_block(chunk)
                 blk_cls = f"hblk hblk-{agg}"
-                # Data attributes for tooltip
-                if b_start < len(all_hours):
-                    hour_key = all_hours[b_start]
+
+                # Timestamps for tooltip
+                if b_start < len(all_buckets):
+                    blk_start_key = all_buckets[b_start]
                 else:
-                    hour_key = ""
-                blocks.append(f'<div class="{blk_cls}" data-name="{html.escape(inst_name, quote=True)}" data-hour="{hour_key}" data-status="{agg}"></div>')
+                    blk_start_key = ""
+                b_end_idx = min(b_start + block_minutes - 1, len(all_buckets) - 1)
+                blk_end_key = all_buckets[b_end_idx] if b_end_idx >= 0 else ""
+
+                # Per-block minute counts for tooltip
+                blk_up = sum(1 for s in chunk if s == "up")
+                blk_down = sum(1 for s in chunk if s == "down")
+                blk_total = len(chunk)
+
+                blocks.append(
+                    f'<div class="{blk_cls}"'
+                    f' data-name="{html.escape(inst_name, quote=True)}"'
+                    f' data-start="{blk_start_key}"'
+                    f' data-end="{blk_end_key}"'
+                    f' data-status="{agg}"'
+                    f' data-up="{blk_up}"'
+                    f' data-down="{blk_down}"'
+                    f' data-total="{blk_total}"'
+                    f'></div>'
+                )
 
             parts.append(f'<div class="heatmap-row{row_hidden}">')
             parts.append(f'<div class="heatmap-label">{html.escape(inst_name)}</div>')
@@ -1308,34 +1436,150 @@ td.center {{ text-align: center; }}
 </script>
 """)
 
-    # Heatmap tooltip JS
+    # Heatmap block tooltip + instance name OCID tooltip JS
     parts.append("""<script>
 (function() {
   var tip = document.getElementById('tooltip');
   if (!tip) return;
-  var statusLabels = {'up': 'Available', 'down': 'Unavailable', 'nodata': 'No data', 'stopped': 'Stopped'};
+
+  // Build arrow element inside tooltip
+  var arrow = document.createElement('div');
+  arrow.className = 'tooltip-arrow';
+  tip.appendChild(arrow);
+
+  var statusLabels = {
+    'up':      'Operational',
+    'down':    'Outage',
+    'nodata':  'No data',
+    'stopped': 'Stopped'
+  };
+  var statusColors = {
+    'up':      '#1d9e75',
+    'down':    '#e24b4a',
+    'nodata':  '#ef9f27',
+    'stopped': '#9e9b94'
+  };
+  var statusBg = {
+    'up':      'rgba(29,158,117,0.15)',
+    'down':    'rgba(226,75,74,0.15)',
+    'nodata':  'rgba(239,159,39,0.15)',
+    'stopped': 'rgba(158,155,148,0.12)'
+  };
+
+  function fmtUtc(isoStr) {
+    if (!isoStr) return '';
+    try {
+      var s = isoStr.replace(' ', 'T');
+      if (!s.endsWith('Z')) s += 'Z';
+      var d = new Date(s);
+      if (isNaN(d.getTime())) return isoStr;
+      var mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
+      var day = d.getUTCDate();
+      var h = String(d.getUTCHours()).padStart(2,'0');
+      var m = String(d.getUTCMinutes()).padStart(2,'0');
+      return mo + ' ' + day + ', ' + h + ':' + m + ' UTC';
+    } catch(e) { return isoStr; }
+  }
+
+  function fmtDur(mins) {
+    mins = parseInt(mins, 10);
+    if (isNaN(mins) || mins < 0) return '\u2014';
+    if (mins === 0) return '0 min';
+    if (mins < 60) return mins + ' min';
+    var h = Math.floor(mins / 60), r = mins % 60;
+    return r ? h + 'h ' + r + 'm' : h + 'h';
+  }
+
+  function positionTip(anchorEl) {
+    tip.style.display = 'block';
+    var rect = anchorEl.getBoundingClientRect();
+    var tw = tip.offsetWidth;
+    var th = tip.offsetHeight;
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    var MARGIN = 10;
+    var ARROW_H = 8;
+
+    // Horizontal: center over element, clamp to viewport
+    var left = rect.left + rect.width / 2 - tw / 2;
+    left = Math.max(MARGIN, Math.min(left, vw - tw - MARGIN));
+
+    // Vertical: prefer above, fall back to below
+    var topAbove = rect.top - th - ARROW_H - 4;
+    var topBelow = rect.bottom + ARROW_H + 4;
+    var above = topAbove >= MARGIN;
+
+    var top = above ? topAbove : topBelow;
+
+    tip.style.left = left + 'px';
+    tip.style.top  = top  + 'px';
+
+    // Arrow: point toward the element
+    arrow.className = 'tooltip-arrow ' + (above ? 'tooltip-arrow-down' : 'tooltip-arrow-up');
+    // Horizontal arrow position relative to tooltip
+    var arrowLeft = rect.left + rect.width / 2 - left;
+    arrowLeft = Math.max(12, Math.min(arrowLeft, tw - 12));
+    arrow.style.left = arrowLeft + 'px';
+    arrow.style.transform = 'none';
+  }
+
+  // ── Heatmap block tooltips ──────────────────────────────────────────────
   document.querySelectorAll('.hblk').forEach(function(el) {
-    el.addEventListener('mouseenter', function(e) {
-      var name = el.getAttribute('data-name') || '';
-      var hour = el.getAttribute('data-hour') || '';
+    el.addEventListener('mouseenter', function() {
+      var name   = el.getAttribute('data-name')   || '';
+      var start  = el.getAttribute('data-start')  || '';
+      var end    = el.getAttribute('data-end')    || '';
       var status = el.getAttribute('data-status') || '';
-      var label = statusLabels[status] || status;
-      var dateStr = '';
-      if (hour) {
-        var d = new Date(hour);
-        dateStr = d.toISOString().split('T')[0] + ' ' + d.getUTCHours() + ':00 UTC';
-      }
-      tip.textContent = name + ' \\u2014 ' + dateStr + ' \\u2014 ' + label;
-      tip.style.display = 'block';
+      var upM    = el.getAttribute('data-up')     || '0';
+      var downM  = el.getAttribute('data-down')   || '0';
+      var totalM = el.getAttribute('data-total')  || '0';
+      var label  = statusLabels[status] || status;
+      var color  = statusColors[status] || '#888780';
+      var bg     = statusBg[status]    || 'rgba(136,135,128,0.1)';
+      var startFmt = fmtUtc(start);
+      var endFmt   = (end && end !== start) ? fmtUtc(end) : '';
+      var timeStr  = endFmt ? (startFmt + ' \u2013 ' + endFmt) : startFmt;
+
+      var upPct = parseInt(totalM,10) > 0
+        ? Math.round(parseInt(upM,10) / parseInt(totalM,10) * 100)
+        : (status === 'up' ? 100 : 0);
+
+      // Build content (arrow will be appended after setting innerHTML)
+      tip.innerHTML =
+        '<div style="font-weight:700;font-size:13px;margin-bottom:2px;color:#f5f2eb;">' + name + '</div>' +
+        '<div style="color:#7c7a73;font-size:10px;margin-bottom:8px;">' + timeStr + '</div>' +
+        '<div style="display:flex;align-items:center;gap:8px;background:' + bg + ';border-radius:6px;padding:7px 10px;margin-bottom:6px;">' +
+          '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:' + color + ';flex-shrink:0;"></span>' +
+          '<span style="font-weight:600;font-size:12px;color:#f5f2eb;">' + label + '</span>' +
+          (status === 'up' || status === 'down' ? '<span style="margin-left:auto;font-size:11px;color:' + color + ';font-weight:600;">' + upPct + '% up</span>' : '') +
+        '</div>' +
+        '<div style="font-size:11px;line-height:1.9;color:#9e9b94;border-top:1px solid rgba(255,255,255,0.07);padding-top:6px;">' +
+          '<div style="display:flex;justify-content:space-between;"><span>Uptime</span><span style="color:#e8e5dc;font-variant-numeric:tabular-nums;">' + fmtDur(upM) + ' / ' + fmtDur(totalM) + '</span></div>' +
+          (parseInt(downM,10) > 0 ? '<div style="display:flex;justify-content:space-between;"><span>Downtime</span><span style="color:#e24b4a;font-variant-numeric:tabular-nums;">' + fmtDur(downM) + '</span></div>' : '') +
+        '</div>';
+      tip.appendChild(arrow);
+      positionTip(el);
     });
-    el.addEventListener('mousemove', function(e) {
-      tip.style.left = (e.clientX + 12) + 'px';
-      tip.style.top = (e.clientY - 20) + 'px';
-    });
-    el.addEventListener('mouseleave', function() {
-      tip.style.display = 'none';
-    });
+    el.addEventListener('mouseleave', function() { tip.style.display = 'none'; });
   });
+
+  // ── Instance name OCID tooltips ─────────────────────────────────────────
+  document.querySelectorAll('.inst-name').forEach(function(el) {
+    el.addEventListener('mouseenter', function() {
+      var ocid = el.getAttribute('data-ocid') || '';
+      tip.innerHTML =
+        '<div style="color:#7c7a73;font-size:10px;font-weight:600;letter-spacing:0.8px;margin-bottom:5px;text-transform:uppercase;">Instance OCID</div>' +
+        '<div style="font-family:\\'Courier New\\',\\'SF Mono\\',monospace;font-size:10px;word-break:break-all;color:#a8c8f0;line-height:1.6;">' + ocid + '</div>' +
+        '<div style="font-size:10px;color:#7c7a73;margin-top:5px;border-top:1px solid rgba(255,255,255,0.07);padding-top:5px;">Click to copy \u2192 not yet enabled</div>';
+      tip.appendChild(arrow);
+      positionTip(el);
+    });
+    el.addEventListener('mouseleave', function() { tip.style.display = 'none'; });
+  });
+
+  // Hide tip on scroll
+  window.addEventListener('scroll', function() { tip.style.display = 'none'; }, true);
+
 })();
 </script>
 """)
@@ -1502,10 +1746,10 @@ def main():
     # Phase 3: Collect metrics
     end_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     start_time = end_time - timedelta(days=args.days)
-    hourly_buckets = build_hourly_buckets(start_time, end_time)
+    time_buckets = build_time_buckets(start_time, end_time, resolution="1m")
 
-    log.info("Collecting metrics for %d instances over %d days (%d hours)...",
-             len(instances), args.days, len(hourly_buckets))
+    log.info("Collecting metrics for %d instances over %d days (%d minute buckets)...",
+             len(instances), args.days, len(time_buckets))
     monitoring_client = make_client(oci.monitoring.MonitoringClient, config, signer)
     cpu_metrics, status_metrics, failed_instance_ids = collect_all_metrics(
         monitoring_client, args.compartment_id, compartment_map,
@@ -1519,7 +1763,7 @@ def main():
     # Phase 4: Compute availability
     log.info("Computing availability...")
     matrix = build_availability_matrix(
-        instances, hourly_buckets, cpu_metrics, status_metrics, failed_instance_ids
+        instances, time_buckets, cpu_metrics, status_metrics, failed_instance_ids
     )
 
     # Merge stats into instance dicts
@@ -1529,10 +1773,10 @@ def main():
 
     fleet = compute_fleet_stats(instances, args.sla_target, discovery_warnings=disc_warnings)
 
-    # Build heatmap data (list of statuses per instance)
+    # Build heatmap data (list of statuses per instance, one per minute bucket)
     heatmap_data = {}
     for inst in instances:
-        heatmap_data[inst["id"]] = [matrix[inst["id"]][h] for h in hourly_buckets]
+        heatmap_data[inst["id"]] = [matrix[inst["id"]][b] for b in time_buckets]
 
     # Phase 5: Render
     log.info("Generating report...")
@@ -1543,13 +1787,13 @@ def main():
         instances=instances,
         fleet=fleet,
         heatmap_data=heatmap_data,
-        all_hours=hourly_buckets,
+        all_buckets=time_buckets,
         compartment_name=compartment_name,
         region=region,
         days=args.days,
         sla_target=args.sla_target,
-        start_date=start_time.strftime("%b %d, %Y"),
-        end_date=(end_time - timedelta(hours=1)).strftime("%b %d, %Y"),
+        start_date=start_time.strftime("%b %d, %Y %H:%M UTC"),
+        end_date=(end_time - timedelta(minutes=1)).strftime("%b %d, %Y %H:%M UTC"),
         title=args.title,
         logo_data=logo_data,
         discovery_warnings=disc_warnings if disc_warnings else None,
@@ -1580,7 +1824,7 @@ def main():
             print(par_url)
 
     log.info("Done. Fleet availability: %s",
-             f"{fleet['fleet_availability_pct']}%" if fleet['fleet_availability_pct'] is not None else "N/A")
+             f"{fleet['fleet_availability_pct']:.4f}%" if fleet['fleet_availability_pct'] is not None else "N/A")
 
 
 if __name__ == "__main__":
