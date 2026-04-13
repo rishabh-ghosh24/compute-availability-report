@@ -547,9 +547,11 @@ def group_instances_by_compartment(instances):
 DATAPOINT_LIMIT = 80_000  # safety margin below 100K API limit
 
 # Retry configuration for transient API errors (429 TooManyRequests, 5xx).
-# 400 errors are not retried — they indicate a query bug, not a transient fault.
+# Most 400 errors are not retried — they indicate a query bug, not a transient fault.
+# Exception: "Server is busy" 400s are transient and are retried like 429/5xx.
 MAX_RETRIES = 3
-RETRY_BACKOFF = 2  # seconds; doubles each attempt (2s, 4s, 8s)
+RETRY_BACKOFF = 2          # seconds; doubles each attempt (2s, 4s, 8s)
+LIMIT_EXCEEDED_BACKOFF = 15  # longer base for LimitExceeded (15s, 30s, 60s)
 
 # Minimum pause between consecutive instance_status calls to avoid sustained 429s.
 # At 1100 instances: 1100 × 0.05 s = 55 s added, but retry storms (2–8 s each) eliminated.
@@ -638,7 +640,16 @@ def collect_metrics(monitoring_client, compartment_id, namespace, metric_name,
         except oci.exceptions.ServiceError as e:
             last_exc = e
             if e.status == 400:
-                # Query error (bad filter, unsupported pattern) — retrying won't help
+                # "Server is busy" is a transient 400 — fall through to retry logic
+                if "server is busy" in (e.message or "").lower():
+                    # LimitExceeded needs a much longer backoff than generic transient errors
+                    base = LIMIT_EXCEEDED_BACKOFF if getattr(e, "code", "") == "LimitExceeded" else RETRY_BACKOFF
+                    wait = base * (2 ** (attempt - 1))
+                    log.warning(f"Metric query attempt {attempt}/{MAX_RETRIES} failed (400, server busy) "
+                                f"for {namespace}/{metric_name} — retrying in {wait}s")
+                    _time.sleep(wait)
+                    continue
+                # Other 400s are query errors (bad filter, invalid range) — retrying won't help
                 log.warning(f"Metric query failed (400, not retrying) for "
                             f"{namespace}/{metric_name} in {compartment_id[:30]}...: {e.message}")
                 return {}, True
@@ -1500,8 +1511,16 @@ def main():
         sys.exit(1)
 
     # Phase 3: Collect metrics
-    end_time = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    now = datetime.now(timezone.utc)
+    end_time = now.replace(minute=0, second=0, microsecond=0)
     start_time = end_time - timedelta(days=args.days)
+    # OCI retains metrics for exactly 90 days from now (not from the truncated hour).
+    # Clamp start_time so it never falls before that boundary.
+    retention_floor = (now - timedelta(days=90) + timedelta(hours=1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    if start_time < retention_floor:
+        start_time = retention_floor
     hourly_buckets = build_hourly_buckets(start_time, end_time)
 
     log.info("Collecting metrics for %d instances over %d days (%d hours)...",
