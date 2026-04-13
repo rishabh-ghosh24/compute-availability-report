@@ -1482,3 +1482,315 @@ class TestDiscoveryWarningFormat:
         assert comp_label in warning
         assert comp_id in warning
         assert error_msg in warning
+
+
+# ---------------------------------------------------------------------------
+# Tests for "Server is busy" 400 retry behaviour
+# ---------------------------------------------------------------------------
+
+def _oci_service_error(status, message, code="ServiceError"):
+    """Construct a real oci.exceptions.ServiceError if OCI is available."""
+    try:
+        import oci
+        return oci.exceptions.ServiceError(status, code, {}, message)
+    except Exception:
+        pytest.skip("oci package not available")
+
+
+class TestCollectMetricsBusyRetry:
+    """400 'Server is busy' errors must be retried; other 400s must not."""
+
+    def _start_end(self):
+        end = datetime(2026, 3, 31, 0, 0, 0, tzinfo=timezone.utc)
+        start = end - timedelta(days=7)
+        return start, end
+
+    def test_server_busy_400_is_retried(self):
+        """A 400 with 'Server is busy' message must be retried, not bailed on immediately."""
+        err = _oci_service_error(400, "Server is busy at this moment.")
+        response = MagicMock()
+        response.data = []
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, response]
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                             "CpuUtilization", start, end)
+        assert not failed
+        assert client.summarize_metrics_data.call_count == 2
+
+    def test_server_busy_400_retried_up_to_max_retries(self):
+        """Persistent 'Server is busy' 400s exhaust MAX_RETRIES and return failed=True."""
+        from compute_availability_report import MAX_RETRIES
+        err = _oci_service_error(400, "Server is busy at this moment.")
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = err
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                             "CpuUtilization", start, end)
+        assert failed is True
+        assert result == {}
+        assert client.summarize_metrics_data.call_count == MAX_RETRIES
+
+    def test_server_busy_then_success_returns_data(self):
+        """Two busy 400s followed by success must return failed=False with real data."""
+        err = _oci_service_error(400, "Server is busy at this moment.")
+        dp = MagicMock()
+        dp.timestamp = datetime(2026, 3, 24, 5, 0, 0, tzinfo=timezone.utc)
+        dp.value = 55.0
+        metric_data = MagicMock()
+        metric_data.dimensions = {"resourceId": "ocid1.instance.aaa"}
+        metric_data.aggregated_datapoints = [dp]
+        response = MagicMock()
+        response.data = [metric_data]
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, err, response]
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                             "CpuUtilization", start, end)
+        assert not failed
+        assert result["ocid1.instance.aaa"]["2026-03-24T05:00:00Z"] == 55.0
+        assert client.summarize_metrics_data.call_count == 3
+
+    def test_server_busy_case_insensitive(self):
+        """Match must be case-insensitive — 'SERVER IS BUSY' should also retry."""
+        err = _oci_service_error(400, "SERVER IS BUSY at this moment.")
+        response = MagicMock()
+        response.data = []
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, response]
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                             "CpuUtilization", start, end)
+        assert not failed
+        assert client.summarize_metrics_data.call_count == 2
+
+    def test_other_400_not_retried(self):
+        """Non-busy 400 errors (bad range, bad filter) must bail immediately."""
+        err = _oci_service_error(400, "Invalid query range. Choose a range within the last 90 days.")
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = err
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                             "CpuUtilization", start, end)
+        assert failed is True
+        assert client.summarize_metrics_data.call_count == 1  # no retry
+
+    def test_400_with_word_busy_in_other_context_not_retried(self):
+        """A 400 message that contains 'busy' but is NOT 'server is busy' must not be retried."""
+        err = _oci_service_error(400, "Resource is too busy to handle the request.")
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = err
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                             "CpuUtilization", start, end)
+        assert failed is True
+        assert client.summarize_metrics_data.call_count == 1  # must not retry
+
+    def test_400_null_message_not_retried(self):
+        """A 400 with message=None must not be retried (and must not crash)."""
+        err = _oci_service_error(400, None)
+        # Overwrite message to truly be None (constructor may coerce it)
+        err.message = None
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = err
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                             "CpuUtilization", start, end)
+        assert failed is True
+        assert client.summarize_metrics_data.call_count == 1
+
+    def test_busy_retry_uses_exponential_backoff(self):
+        """Non-LimitExceeded busy errors use RETRY_BACKOFF as the base."""
+        from compute_availability_report import RETRY_BACKOFF
+        err = _oci_service_error(400, "Server is busy at this moment.")  # code="ServiceError"
+        response = MagicMock()
+        response.data = []
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, response]
+        start, end = self._start_end()
+        with patch("time.sleep") as mock_sleep:
+            collect_metrics(client, "comp1", "oci_computeagent", "CpuUtilization", start, end)
+        # First retry: wait = RETRY_BACKOFF * 2^0
+        mock_sleep.assert_any_call(RETRY_BACKOFF * (2 ** 0))
+
+    def test_limit_exceeded_uses_longer_backoff(self):
+        """LimitExceeded busy errors use LIMIT_EXCEEDED_BACKOFF, not RETRY_BACKOFF."""
+        from compute_availability_report import LIMIT_EXCEEDED_BACKOFF, RETRY_BACKOFF
+        err = _oci_service_error(400, "Server is busy at this moment.", code="LimitExceeded")
+        response = MagicMock()
+        response.data = []
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, response]
+        start, end = self._start_end()
+        with patch("time.sleep") as mock_sleep:
+            collect_metrics(client, "comp1", "oci_computeagent", "CpuUtilization", start, end)
+        actual_wait = mock_sleep.call_args_list[0][0][0]
+        assert actual_wait == LIMIT_EXCEEDED_BACKOFF * (2 ** 0)
+        assert actual_wait != RETRY_BACKOFF * (2 ** 0), "LimitExceeded must use longer backoff"
+
+    def test_limit_exceeded_backoff_sequence(self):
+        """LimitExceeded backoff doubles correctly: 15s, 30s across two failures."""
+        from compute_availability_report import LIMIT_EXCEEDED_BACKOFF
+        err = _oci_service_error(400, "Server is busy at this moment.", code="LimitExceeded")
+        response = MagicMock()
+        response.data = []
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = [err, err, response]
+        start, end = self._start_end()
+        with patch("time.sleep") as mock_sleep:
+            collect_metrics(client, "comp1", "oci_computeagent", "CpuUtilization", start, end)
+        waits = [c[0][0] for c in mock_sleep.call_args_list]
+        assert waits[0] == LIMIT_EXCEEDED_BACKOFF * 1   # attempt 1: base * 2^0
+        assert waits[1] == LIMIT_EXCEEDED_BACKOFF * 2   # attempt 2: base * 2^1
+
+    def test_limit_exceeded_exhausted_returns_failed(self):
+        """Persistent LimitExceeded 400s exhaust MAX_RETRIES and return failed=True."""
+        from compute_availability_report import MAX_RETRIES
+        err = _oci_service_error(400, "Server is busy at this moment.", code="LimitExceeded")
+        client = MagicMock()
+        client.summarize_metrics_data.side_effect = err
+        start, end = self._start_end()
+        with patch("time.sleep"):
+            result, failed = collect_metrics(client, "comp1", "oci_computeagent",
+                                             "CpuUtilization", start, end)
+        assert failed is True
+        assert result == {}
+        assert client.summarize_metrics_data.call_count == MAX_RETRIES
+
+
+# ---------------------------------------------------------------------------
+# Tests for --days / retention-floor clamping logic
+# ---------------------------------------------------------------------------
+
+def _compute_start_end(days, now=None):
+    """Replicate the start_time / retention_floor logic from main() for testing."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    end_time = now.replace(minute=0, second=0, microsecond=0)
+    start_time = end_time - timedelta(days=days)
+    retention_floor = (now - timedelta(days=90) + timedelta(hours=1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    if start_time < retention_floor:
+        start_time = retention_floor
+    return start_time, end_time
+
+
+class TestRetentionFloorClamping:
+    """start_time must always be within OCI's 90-day retention window."""
+
+    def _now_at(self, hour=15, minute=46):
+        """Helper: a fixed 'now' with the given time components."""
+        return datetime(2026, 4, 13, hour, minute, 0, tzinfo=timezone.utc)
+
+    # ------------------------------------------------------------------
+    # days < 90 — clamping must be a no-op
+    # ------------------------------------------------------------------
+
+    def test_days_1_no_clamp(self):
+        now = self._now_at()
+        start, end = _compute_start_end(1, now)
+        expected_start = end - timedelta(days=1)
+        assert start == expected_start
+
+    def test_days_7_no_clamp(self):
+        now = self._now_at()
+        start, end = _compute_start_end(7, now)
+        assert start == end - timedelta(days=7)
+
+    def test_days_30_no_clamp(self):
+        now = self._now_at()
+        start, end = _compute_start_end(30, now)
+        assert start == end - timedelta(days=30)
+
+    def test_days_89_no_clamp(self):
+        now = self._now_at()
+        start, end = _compute_start_end(89, now)
+        assert start == end - timedelta(days=89)
+
+    # ------------------------------------------------------------------
+    # days == 90 — clamping must fire when now is mid-hour
+    # ------------------------------------------------------------------
+
+    def test_days_90_mid_hour_clamps(self):
+        """When now=15:46 and days=90, end=15:00 and start would be 15:00 90d ago
+        which is 46 min before OCI's boundary — must be clamped forward."""
+        now = self._now_at(hour=15, minute=46)
+        start, end = _compute_start_end(90, now)
+        # start must not be before (now - 90d + 1h) floored to hour
+        retention_floor = (now - timedelta(days=90) + timedelta(hours=1)).replace(
+            minute=0, second=0, microsecond=0
+        )
+        assert start >= retention_floor
+
+    def test_days_90_clamp_is_within_90day_window(self):
+        """Clamped start_time must be strictly within OCI's 90-day rolling window."""
+        now = self._now_at(hour=15, minute=46)
+        start, _ = _compute_start_end(90, now)
+        # OCI boundary: now - 90 days (strict). Our start must be AFTER this.
+        oci_boundary = now - timedelta(days=90)
+        assert start > oci_boundary
+
+    def test_days_90_at_exact_hour_boundary_clamps(self):
+        """When now is exactly on the hour, end_time == now.
+        start = end - 90d which lands exactly on the OCI boundary — must still clamp."""
+        now = self._now_at(hour=12, minute=0)
+        start, end = _compute_start_end(90, now)
+        assert end == now  # no truncation needed
+        # start was exactly at the 90d boundary; retention_floor pushes it 1h forward
+        oci_boundary = now - timedelta(days=90)
+        assert start > oci_boundary
+
+    def test_days_90_at_minute_59_clamps(self):
+        """Worst-case: now=HH:59, end=HH:00, start is 59 min before boundary."""
+        now = self._now_at(hour=8, minute=59)
+        start, _ = _compute_start_end(90, now)
+        oci_boundary = now - timedelta(days=90)
+        assert start > oci_boundary
+
+    def test_days_90_clamped_start_is_on_hour_boundary(self):
+        """Clamped start_time must be truncated to the hour (minute=0, second=0)."""
+        now = self._now_at(hour=15, minute=46)
+        start, _ = _compute_start_end(90, now)
+        assert start.minute == 0
+        assert start.second == 0
+        assert start.microsecond == 0
+
+    def test_days_90_hourly_buckets_count(self):
+        """With days=90 and clamping, hourly bucket count must be < 90*24=2160."""
+        now = self._now_at(hour=15, minute=46)
+        start, end = _compute_start_end(90, now)
+        buckets = build_hourly_buckets(start, end)
+        assert len(buckets) < 90 * 24
+        # Must still be close to 90 days worth (within a couple of hours)
+        assert len(buckets) >= 90 * 24 - 3
+
+    def test_days_less_than_90_hourly_buckets_exact(self):
+        """For days<90 no clamping occurs, bucket count must equal days*24 exactly."""
+        now = self._now_at(hour=15, minute=46)
+        for days in (1, 7, 30, 60, 89):
+            start, end = _compute_start_end(days, now)
+            buckets = build_hourly_buckets(start, end)
+            assert len(buckets) == days * 24, f"Expected {days*24} buckets for --days {days}"
+
+    def test_start_time_always_before_end_time(self):
+        """start_time must always be strictly before end_time for any valid --days."""
+        now = self._now_at(hour=15, minute=46)
+        for days in (1, 7, 30, 89, 90):
+            start, end = _compute_start_end(days, now)
+            assert start < end, f"start >= end for --days {days}"
+
+    def test_end_time_truncated_to_hour(self):
+        """end_time must always be truncated to the start of the current hour."""
+        now = self._now_at(hour=15, minute=46)
+        _, end = _compute_start_end(7, now)
+        assert end.minute == 0
+        assert end.second == 0
+        assert end.hour == 15
